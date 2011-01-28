@@ -1,10 +1,9 @@
-hadoop-hbase (0.89.20100924+30-1) cloudera; urgency=low
+hadoop-hbase (0.89.20100924+30-1sg0) foss-development; urgency=low
 
   Commit 141178fbd79e618aff9dc8c328872d929a97bb01:
     CLOUDERA-BUILD. Add man page.
     
  -- Eli Collins <eli@cloudera.com>  Tue, 26 Oct 2010 00:59:28 -0700
-
 
 hadoop-hbase (0.89.20100924+29-1) cloudera; urgency=low
 
