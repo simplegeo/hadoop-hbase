@@ -1,0 +1,23 @@
+From 6647194e4e48aba590a9fba9d3c699ee05510b16 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Wed, 8 Sep 2010 13:45:41 -0700
+Subject: [PATCH 11/30] SequenceFileLogWriter doesn't need to actually call sync()
+
+---
+ .../regionserver/wal/SequenceFileLogWriter.java    |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java b/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java
+index ea59695..7f1b6ce 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java
+@@ -139,4 +139,4 @@ public class SequenceFileLogWriter implements HLog.Writer {
+   public OutputStream getDFSCOutputStream() {
+     return this.dfsClient_out;
+   }
+-}
+\ No newline at end of file
++}
+-- 
+1.7.0.4
+

@@ -1,0 +1,496 @@
+From 59af30dd33787024b7ee43375ea47bc2b3a06674 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Mon, 13 Sep 2010 18:37:11 +0000
+Subject: [PATCH 13/30] HBASE-2980. Refactor region server command line to a new class
+
+Author: Todd Lipcon
+---
+ .../org/apache/hadoop/hbase/master/HMaster.java    |   43 +---------
+ .../hadoop/hbase/master/HMasterCommandLine.java    |   29 +-----
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   96 ++------------------
+ .../regionserver/HRegionServerCommandLine.java     |   87 ++++++++++++++++++
+ .../hadoop/hbase/util/ServerCommandLine.java       |   82 +++++++++++++++++
+ .../apache/hadoop/hbase/master/OOMEHMaster.java    |    5 +-
+ .../hbase/regionserver/OOMERegionServer.java       |    4 +-
+ 7 files changed, 189 insertions(+), 157 deletions(-)
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServerCommandLine.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/util/ServerCommandLine.java
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index bdcd786..7e96062 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -1230,33 +1230,6 @@ public class HMaster extends Thread implements HMasterInterface,
+     }
+   }
+ 
+-  /*
+-   * Version of master that will shutdown the passed zk cluster on its way out.
+-   */
+-  static class LocalHMaster extends HMaster {
+-    private MiniZooKeeperCluster zkcluster = null;
+-
+-    public LocalHMaster(Configuration conf) throws IOException {
+-      super(conf);
+-    }
+-
+-    @Override
+-    public void run() {
+-      super.run();
+-      if (this.zkcluster != null) {
+-        try {
+-          this.zkcluster.shutdown();
+-        } catch (IOException e) {
+-          e.printStackTrace();
+-        }
+-      }
+-    }
+-
+-    void setZKCluster(final MiniZooKeeperCluster zkcluster) {
+-      this.zkcluster = zkcluster;
+-    }
+-  }
+-
+   public Map<String, Integer> getTableFragmentation() throws IOException {
+     long now = System.currentTimeMillis();
+     // only check every two minutes by default
+@@ -1268,22 +1241,10 @@ public class HMaster extends Thread implements HMasterInterface,
+     return fragmentation;
+   }
+   
+-  protected static void doMain(String [] args,
+-      Class<? extends HMaster> masterClass) throws Exception {
+-    int ret = ToolRunner.run(
+-      HBaseConfiguration.create(),
+-      new HMasterCommandLine(masterClass),
+-      args);
+-    if (ret != 0) {
+-      System.exit(ret);
+-    }
+-  }
+-
+   /**
+-   * Main program
+-   * @param args
++   * @see org.apache.hadoop.hbase.master.HMasterCommandLine
+    */
+   public static void main(String [] args) throws Exception {
+-    doMain(args, HMaster.class);
++    new HMasterCommandLine(HMaster.class).doMain(args);
+   }
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java b/src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java
+index 415a0f5..650b277 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java
+@@ -21,8 +21,6 @@ package org.apache.hadoop.hbase.master;
+ 
+ import java.io.IOException;
+ import java.io.File;
+-import java.lang.management.RuntimeMXBean;
+-import java.lang.management.ManagementFactory;
+ import java.util.List;
+ 
+ import org.apache.commons.cli.CommandLine;
+@@ -32,19 +30,17 @@ import org.apache.commons.cli.ParseException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.conf.Configured;
+-import org.apache.hadoop.util.Tool;
+-import org.apache.hadoop.hbase.ZooKeeperConnectionException;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.LocalHBaseCluster;
+ import org.apache.hadoop.hbase.MasterNotRunningException;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.regionserver.HRegionServer;
+-import org.apache.hadoop.hbase.zookeeper.MiniZooKeeperCluster;
++import org.apache.hadoop.hbase.util.ServerCommandLine;
++import org.apache.hadoop.hbase.MiniZooKeeperCluster;
+ import org.apache.zookeeper.KeeperException;
+ 
+-public class HMasterCommandLine extends Configured implements Tool {
++public class HMasterCommandLine extends ServerCommandLine {
+   private static final Log LOG = LogFactory.getLog(HMasterCommandLine.class);
+ 
+   private static final String USAGE =
+@@ -57,29 +53,14 @@ public class HMasterCommandLine extends Configured implements Tool {
+ 
+   private final Class<? extends HMaster> masterClass;
+ 
+-
+   public HMasterCommandLine(Class<? extends HMaster> masterClass) {
+     this.masterClass = masterClass;
+   }
+ 
+-  private void usage(String message) {
+-    if (message != null) {
+-      System.err.println(message);
+-      System.err.println("\n");
+-    }
+-
+-    System.err.println(USAGE);
++  protected String getUsage() {
++    return USAGE;
+   }
+ 
+-  private static void logJVMInfo() {
+-    // Print out vm stats before starting up.
+-    RuntimeMXBean runtime = ManagementFactory.getRuntimeMXBean();
+-    if (runtime != null) {
+-      LOG.info("vmName=" + runtime.getVmName() + ", vmVendor=" +
+-               runtime.getVmVendor() + ", vmVersion=" + runtime.getVmVersion());
+-      LOG.info("vmInputArguments=" + runtime.getInputArguments());
+-    }
+-  }
+ 
+   public int run(String args[]) throws Exception {
+     Options opt = new Options();
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 1426297..8f0ac89 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -50,10 +50,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+-import org.apache.commons.cli.CommandLine;
+-import org.apache.commons.cli.GnuParser;
+-import org.apache.commons.cli.Options;
+-import org.apache.commons.cli.ParseException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -2132,6 +2128,10 @@ public class HRegionServer implements HRegionInterface,
+     return getOnlineRegions().toArray(new HRegion[0]);
+   }
+ 
++  public int getNumberOfOnlineRegions() {
++    return onlineRegions.size();
++  }
++
+   /**
+    * @return The HRegionInfos from online regions sorted
+    */
+@@ -2442,18 +2442,6 @@ public class HRegionServer implements HRegionInterface,
+     return t;
+   }
+ 
+-  private static void printUsageAndExit() {
+-    printUsageAndExit(null);
+-  }
+-
+-  private static void printUsageAndExit(final String message) {
+-    if (message != null) {
+-      System.err.println(message);
+-    }
+-    System.err.println("Usage: java org.apache.hbase.HRegionServer start|stop [-D <conf.param=value>]");
+-    System.exit(0);
+-  }
+-
+   /**
+    * Utility for constructing an instance of the passed HRegionServer class.
+    * @param regionServerClass
+@@ -2478,78 +2466,14 @@ public class HRegionServer implements HRegionInterface,
+   }
+ 
+   /**
+-   * Do class main.
+-   * @param args
+-   * @param regionServerClass HRegionServer to instantiate.
+-   */
+-  protected static void doMain(final String [] args,
+-      final Class<? extends HRegionServer> regionServerClass) {
+-    Configuration conf = HBaseConfiguration.create();
+-
+-    Options opt = new Options();
+-    opt.addOption("D", true, "Override HBase Configuration Settings");
+-    try {
+-      CommandLine cmd = new GnuParser().parse(opt, args);
+-
+-      if (cmd.hasOption("D")) {
+-        for (String confOpt : cmd.getOptionValues("D")) {
+-          String[] kv = confOpt.split("=", 2);
+-          if (kv.length == 2) {
+-            conf.set(kv[0], kv[1]);
+-            LOG.debug("-D configuration override: " + kv[0] + "=" + kv[1]);
+-          } else {
+-            throw new ParseException("-D option format invalid: " + confOpt);
+-          }
+-        }
+-      }
+-
+-      if (cmd.getArgList().contains("start")) {
+-        try {
+-          // If 'local', don't start a region server here.  Defer to
+-          // LocalHBaseCluster.  It manages 'local' clusters.
+-          if (LocalHBaseCluster.isLocal(conf)) {
+-            LOG.warn("Not starting a distinct region server because " +
+-              HConstants.CLUSTER_DISTRIBUTED + " is false");
+-          } else {
+-            RuntimeMXBean runtime = ManagementFactory.getRuntimeMXBean();
+-            if (runtime != null) {
+-              LOG.info("vmInputArguments=" + runtime.getInputArguments());
+-            }
+-            HRegionServer hrs = constructRegionServer(regionServerClass, conf);
+-            startRegionServer(hrs);
+-          }
+-        } catch (Throwable t) {
+-          LOG.error( "Can not start region server because "+
+-              StringUtils.stringifyException(t) );
+-          System.exit(-1);
+-        }
+-      } else if (cmd.getArgList().contains("stop")) {
+-        throw new ParseException("To shutdown the regionserver run " +
+-            "bin/hbase-daemon.sh stop regionserver or send a kill signal to" +
+-            "the regionserver pid");
+-      } else {
+-        throw new ParseException("Unknown argument(s): " +
+-            org.apache.commons.lang.StringUtils.join(cmd.getArgs(), " "));
+-      }
+-    } catch (ParseException e) {
+-      LOG.error("Could not parse", e);
+-      printUsageAndExit();
+-    }
+-  }
+-
+-  /**
+-   * @param args
++   * @see org.apache.hadoop.hbase.regionserver.HRegionServerCommandLine
+    */
+-  public static void main(String [] args) {
++  public static void main(String[] args) throws Exception {
+     Configuration conf = HBaseConfiguration.create();
+     @SuppressWarnings("unchecked")
+-    Class<? extends HRegionServer> regionServerClass =
+-      (Class<? extends HRegionServer>) conf.getClass(HConstants.REGION_SERVER_IMPL,
+-        HRegionServer.class);
+-    doMain(args, regionServerClass);
+-  }
++    Class<? extends HRegionServer> regionServerClass = (Class<? extends HRegionServer>) conf
++        .getClass(HConstants.REGION_SERVER_IMPL, HRegionServer.class);
+ 
+-  public int getNumberOfOnlineRegions() {
+-    return onlineRegions.size();
++    new HRegionServerCommandLine(regionServerClass).doMain(args);
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServerCommandLine.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServerCommandLine.java
+new file mode 100644
+index 0000000..71b9985
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServerCommandLine.java
+@@ -0,0 +1,87 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.LocalHBaseCluster;
++import org.apache.hadoop.hbase.util.ServerCommandLine;
++
++/**
++ * Class responsible for parsing the command line and starting the
++ * RegionServer.
++ */
++public class HRegionServerCommandLine extends ServerCommandLine {
++  private static final Log LOG = LogFactory.getLog(HRegionServerCommandLine.class);
++
++  private final Class<? extends HRegionServer> regionServerClass;
++
++  private static final String USAGE =
++    "Usage: HRegionServer [-D conf.param=value] start";
++
++  public HRegionServerCommandLine(Class<? extends HRegionServer> clazz) {
++    this.regionServerClass = clazz;
++  }
++
++  protected String getUsage() {
++    return USAGE;
++  }
++
++  private int start() throws Exception {
++    Configuration conf = getConf();
++
++    // If 'local', don't start a region server here. Defer to
++    // LocalHBaseCluster. It manages 'local' clusters.
++    if (LocalHBaseCluster.isLocal(conf)) {
++      LOG.warn("Not starting a distinct region server because "
++               + HConstants.CLUSTER_DISTRIBUTED + " is false");
++    } else {
++      logJVMInfo();
++      HRegionServer hrs = HRegionServer.constructRegionServer(regionServerClass, conf);
++      HRegionServer.startRegionServer(hrs);
++    }
++    return 0;
++  }
++
++  public int run(String args[]) throws Exception {
++    if (args.length != 1) {
++      usage(null);
++      return -1;
++    }
++
++    String cmd = args[0];
++
++    if ("start".equals(cmd)) {
++      return start();
++    } else if ("stop".equals(cmd)) {
++      System.err.println(
++        "To shutdown the regionserver run " +
++        "bin/hbase-daemon.sh stop regionserver or send a kill signal to" +
++        "the regionserver pid");
++      return -1;
++    } else {
++      usage("Unknown command: " + args[0]);
++      return -1;
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/util/ServerCommandLine.java b/src/main/java/org/apache/hadoop/hbase/util/ServerCommandLine.java
+new file mode 100644
+index 0000000..b2f3770
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/util/ServerCommandLine.java
+@@ -0,0 +1,82 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.util;
++
++import java.lang.management.RuntimeMXBean;
++import java.lang.management.ManagementFactory;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.conf.Configured;
++import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.util.Tool;
++import org.apache.hadoop.util.ToolRunner;
++
++/**
++ * Base class for command lines that start up various HBase daemons.
++ */
++public abstract class ServerCommandLine extends Configured implements Tool {
++  private static final Log LOG = LogFactory.getLog(ServerCommandLine.class);
++
++  /**
++   * Implementing subclasses should return a usage string to print out.
++   */
++  protected abstract String getUsage();
++
++  /**
++   * Print usage information for this command line.
++   *
++   * @param message if not null, print this message before the usage info.
++   */
++  protected void usage(String message) {
++    if (message != null) {
++      System.err.println(message);
++      System.err.println("");
++    }
++
++    System.err.println(getUsage());
++  }
++
++  /**
++   * Log information about the currently running JVM.
++   */
++  public static void logJVMInfo() {
++    // Print out vm stats before starting up.
++    RuntimeMXBean runtime = ManagementFactory.getRuntimeMXBean();
++    if (runtime != null) {
++      LOG.info("vmName=" + runtime.getVmName() + ", vmVendor=" +
++               runtime.getVmVendor() + ", vmVersion=" + runtime.getVmVersion());
++      LOG.info("vmInputArguments=" + runtime.getInputArguments());
++    }
++  }
++
++  /**
++   * Parse and run the given command line. This may exit the JVM if
++   * a nonzero exit code is returned from <code>run()</code>.
++   */
++  public void doMain(String args[]) throws Exception {
++    int ret = ToolRunner.run(
++      HBaseConfiguration.create(), this, args);
++    if (ret != 0) {
++      System.exit(ret);
++    }
++  }
++}
+diff --git a/src/test/java/org/apache/hadoop/hbase/master/OOMEHMaster.java b/src/test/java/org/apache/hadoop/hbase/master/OOMEHMaster.java
+index a6f148e..21c6e82 100644
+--- a/src/test/java/org/apache/hadoop/hbase/master/OOMEHMaster.java
++++ b/src/test/java/org/apache/hadoop/hbase/master/OOMEHMaster.java
+@@ -50,10 +50,7 @@ public class OOMEHMaster extends HMaster {
+     return super.regionServerReport(serverInfo, msgs, mostLoadedRegions);
+   }
+ 
+-  /**
+-   * @param args
+-   */
+   public static void main(String[] args) throws Exception {
+-    doMain(args, OOMEHMaster.class);
++    new HMasterCommandLine(OOMEHMaster.class).doMain(args);
+   }
+ }
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/OOMERegionServer.java b/src/test/java/org/apache/hadoop/hbase/regionserver/OOMERegionServer.java
+index fd1d1bf..87891c9 100644
+--- a/src/test/java/org/apache/hadoop/hbase/regionserver/OOMERegionServer.java
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/OOMERegionServer.java
+@@ -49,7 +49,7 @@ public class OOMERegionServer extends HRegionServer {
+     }
+   }
+ 
+-  public static void main(String[] args) {
+-    HRegionServer.doMain(args, OOMERegionServer.class);
++  public static void main(String[] args) throws Exception {
++    new HRegionServerCommandLine(OOMERegionServer.class).doMain(args);
+   }
+ }
+\ No newline at end of file
+-- 
+1.7.0.4
+

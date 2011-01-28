@@ -1,0 +1,24 @@
+From 3190f7406c74c716fe09f693589314c67b98b62b Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Thu, 7 Oct 2010 19:56:33 -0700
+Subject: [PATCH 23/30] CLOUDERA-BUILD. cloudera directory should get installed
+
+---
+ cloudera/install_hbase.sh |    1 +
+ 1 files changed, 1 insertions(+), 0 deletions(-)
+
+diff --git a/cloudera/install_hbase.sh b/cloudera/install_hbase.sh
+index dd96245..247780e 100755
+--- a/cloudera/install_hbase.sh
++++ b/cloudera/install_hbase.sh
+@@ -94,6 +94,7 @@ install -d -m 0755 $PREFIX/$BIN_DIR
+ install -d -m 0755 $PREFIX/$ETC_DIR
+ 
+ cp -ra lib/* ${PREFIX}/${LIB_DIR}/lib/
++cp -a cloudera ${PREFIX}/${LIB_DIR}/cloudera
+ cp hbase*.jar $PREFIX/$LIB_DIR/
+ 
+ # Make an unversioned jar symlink so that other
+-- 
+1.7.0.4
+

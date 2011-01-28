@@ -1,0 +1,25 @@
+From 8acae9396f84c90c4b4513d4644fb30389c6847c Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@lipcon.org>
+Date: Thu, 30 Sep 2010 23:27:21 -0700
+Subject: [PATCH 20/30] Fix src assembly to make java libs 644, and not include hbase lib twice
+
+---
+ src/assembly/bin.xml |    2 ++
+ 1 files changed, 2 insertions(+), 0 deletions(-)
+
+diff --git a/src/assembly/bin.xml b/src/assembly/bin.xml
+index 06e45a9..416c46a 100644
+--- a/src/assembly/bin.xml
++++ b/src/assembly/bin.xml
+@@ -52,6 +52,8 @@
+       <outputDirectory>/lib</outputDirectory>
+       <unpack>false</unpack>
+       <scope>runtime</scope>
++      <fileMode>644</fileMode>
++      <useProjectArtifact>false</useProjectArtifact>
+     </dependencySet>
+   </dependencySets>
+ </assembly>
+-- 
+1.7.0.4
+

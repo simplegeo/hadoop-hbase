@@ -1,0 +1,25 @@
+From 427f35f2dc730c553d9be1c0d78d7b695e4b2b76 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Thu, 30 Sep 2010 22:50:02 -0700
+Subject: [PATCH 19/30] CLOUDERA-BUILD. Fix copy of bin/ to be cp -a
+
+---
+ cloudera/install_hbase.sh |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/cloudera/install_hbase.sh b/cloudera/install_hbase.sh
+index 6e9f257..65f7e71 100755
+--- a/cloudera/install_hbase.sh
++++ b/cloudera/install_hbase.sh
+@@ -100,7 +100,7 @@ cp *.txt $PREFIX/$DOC_DIR/
+ cp -a hbase-webapps $PREFIX/$LIB_DIR
+ 
+ cp -a conf $PREFIX/$ETC_DIR/conf
+-cp bin/* $PREFIX/$BIN_DIR
++cp -a bin/* $PREFIX/$BIN_DIR/
+ 
+ ln -s $ETC_DIR/conf $PREFIX/$LIB_DIR/conf
+ 
+-- 
+1.7.0.4
+

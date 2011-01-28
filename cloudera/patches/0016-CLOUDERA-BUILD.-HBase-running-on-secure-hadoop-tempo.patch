@@ -1,0 +1,985 @@
+From 74542880d740e9be24b103f1d5f5c6489d01911c Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Mon, 30 Aug 2010 16:25:56 -0700
+Subject: [PATCH 16/30] CLOUDERA-BUILD. HBase running on secure hadoop, temporary patch.
+
+This is not upstreamed, since it currently is very difficult to do this
+without reflection or a shim layer. This will be upstreamed with the
+larger project of HBase security later this year.
+
+Author: Todd Lipcon
+---
+ .../org/apache/hadoop/hbase/ipc/HBaseClient.java   |    4 +-
+ .../java/org/apache/hadoop/hbase/ipc/HBaseRPC.java |    3 +-
+ .../org/apache/hadoop/hbase/ipc/HBaseServer.java   |   24 ++-
+ .../org/apache/hadoop/hbase/master/HMaster.java    |   45 +++++-
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   59 ++++++-
+ .../apache/hadoop/hbase/util/JVMClusterUtil.java   |   60 ++++++-
+ .../apache/hadoop/hbase/HBaseTestingUtility.java   |   12 +-
+ .../org/apache/hadoop/hbase/MiniHBaseCluster.java  |   37 ++---
+ .../hadoop/hbase/regionserver/TestStore.java       |   82 +++++----
+ .../hbase/regionserver/wal/TestWALReplay.java      |  180 +++++++++++---------
+ 10 files changed, 330 insertions(+), 176 deletions(-)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
+index 2b5eeb6..dbd4803 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
+@@ -25,7 +25,6 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.DataOutputBuffer;
+ import org.apache.hadoop.io.IOUtils;
+-import org.apache.hadoop.io.ObjectWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableUtils;
+ import org.apache.hadoop.ipc.RemoteException;
+@@ -385,8 +384,7 @@ public class HBaseClient {
+       out.write(HBaseServer.CURRENT_VERSION);
+       //When there are more fields we can have ConnectionHeader Writable.
+       DataOutputBuffer buf = new DataOutputBuffer();
+-      ObjectWritable.writeObject(buf, remoteId.getTicket(),
+-                                 UserGroupInformation.class, conf);
++      WritableUtils.writeString(buf, remoteId.getTicket().getUserName());
+       int bufLen = buf.getLength();
+       out.writeInt(bufLen);
+       out.write(buf.getData(), 0, bufLen);
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java
+index 2d90d4e..58e9d0d 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java
+@@ -381,7 +381,8 @@ public class HBaseRPC {
+   public static VersionedProtocol getProxy(Class<?> protocol,
+       long clientVersion, InetSocketAddress addr, Configuration conf,
+       SocketFactory factory) throws IOException {
+-    return getProxy(protocol, clientVersion, addr, null, conf, factory);
++    UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
++    return getProxy(protocol, clientVersion, addr, ugi, conf, factory);
+   }
+ 
+   /**
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java
+index 54966ef..23ce98e 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java
+@@ -23,7 +23,6 @@ package org.apache.hadoop.hbase.ipc;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.io.ObjectWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableUtils;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -61,6 +60,7 @@ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.LinkedBlockingQueue;
++import java.security.PrivilegedExceptionAction;
+ 
+ /** An abstract IPC service.  IPC calls take a single {@link Writable} as a
+  * parameter, and return a {@link Writable} as their value.  A service runs on
+@@ -944,7 +944,8 @@ public abstract class HBaseServer {
+        */
+       DataInputStream in =
+         new DataInputStream(new ByteArrayInputStream(data.array()));
+-      ticket = (UserGroupInformation) ObjectWritable.readObject(in, conf);
++      String username = WritableUtils.readString(in);
++      ticket = UserGroupInformation.createRemoteUser(username);
+     }
+ 
+     private void processData() throws  IOException, InterruptedException {
+@@ -990,7 +991,7 @@ public abstract class HBaseServer {
+       ByteArrayOutputStream buf = new ByteArrayOutputStream(buffersize);
+       while (running) {
+         try {
+-          Call call = callQueue.take(); // pop the queue; maybe blocked here
++          final Call call = callQueue.take(); // pop the queue; maybe blocked here
+ 
+           if (LOG.isDebugEnabled())
+             LOG.debug(getName() + ": has #" + call.id + " from " +
+@@ -1001,16 +1002,25 @@ public abstract class HBaseServer {
+           Writable value = null;
+ 
+           CurCall.set(call);
+-          UserGroupInformation previous = UserGroupInformation.getCurrentUGI();
+-          UserGroupInformation.setCurrentUser(call.connection.ticket);
+           try {
+-            value = call(call.param, call.timestamp);             // make the call
++/*
++TODO: Currently we do not assume the context of the user who is
++requesting, since security hasn't been fully integrated in HBase.
++
++            value = call.connection.ticket.doAs(
++              new PrivilegedExceptionAction<Writable>() {
++                @Override
++                public Writable run() throws Exception {
++                  return call(call.param, call.timestamp);
++                }
++              });
++*/
++            value = call(call.param, call.timestamp);
+           } catch (Throwable e) {
+             LOG.debug(getName()+", call "+call+": error: " + e, e);
+             errorClass = e.getClass().getName();
+             error = StringUtils.stringifyException(e);
+           }
+-          UserGroupInformation.setCurrentUser(previous);
+           CurCall.set(null);
+ 
+           if (buf.size() > buffersize) {
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 7e96062..f04c9c4 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.master;
+ import java.io.File;
+ import java.io.IOException;
+ import java.lang.reflect.Constructor;
++import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+@@ -34,6 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
++import java.security.PrivilegedExceptionAction;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -91,13 +93,17 @@ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.net.DNS;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.zookeeper.WatchedEvent;
+ import org.apache.zookeeper.Watcher;
+ import org.apache.zookeeper.Watcher.Event.EventType;
+ import org.apache.zookeeper.Watcher.Event.KeeperState;
+ 
++import com.google.common.base.Throwables;
+ import com.google.common.collect.Lists;
+ 
++
+ /**
+  * HMaster is the "master server" for HBase. An HBase cluster has one active
+  * master.  If many masters are started, all compete.  Whichever wins goes on to
+@@ -142,6 +148,7 @@ public class HMaster extends Thread implements HMasterInterface,
+   private final Sleeper sleeper;
+   // Keep around for convenience.
+   private final FileSystem fs;
++  // Authenticated user
+   // Is the fileystem ok?
+   private volatile boolean fsOk = true;
+   // The Path to the old logs dir
+@@ -168,7 +175,7 @@ public class HMaster extends Thread implements HMasterInterface,
+    */
+   public HMaster(Configuration conf) throws IOException {
+     this.conf = conf;
+-    
++
+     // Figure out if this is a fresh cluster start. This is done by checking the 
+     // number of RS ephemeral nodes. RS ephemeral nodes are created only after 
+     // the primary master has written the address to ZK. So this has to be done 
+@@ -794,6 +801,7 @@ public class HMaster extends Thread implements HMasterInterface,
+       } catch (TableExistsException e) {
+         throw e;
+       } catch (IOException e) {
++        LOG.warn("Couldn't create table", e);
+         if (tries == this.numRetries - 1) {
+           throw RemoteExceptionHandler.checkIOException(e);
+         }
+@@ -1217,18 +1225,47 @@ public class HMaster extends Thread implements HMasterInterface,
+    * @param conf
+    * @return HMaster instance.
+    */
+-  public static HMaster constructMaster(Class<? extends HMaster> masterClass,
++  public static HMaster constructMaster(
++      final Class<? extends HMaster> masterClass,
+       final Configuration conf)  {
+     try {
+-      Constructor<? extends HMaster> c =
++      final Constructor<? extends HMaster> c =
+         masterClass.getConstructor(Configuration.class);
+-      return c.newInstance(conf);
++      UserGroupInformation ugi = loginFromKeytab(conf);
++      HMaster master = ugi.doAs(new PrivilegedExceptionAction<HMaster>() { 
++        public HMaster run() throws Exception {
++          return c.newInstance(conf);
++        }
++      });
++      return master;
+     } catch (Exception e) {
+       throw new RuntimeException("Failed construction of " +
+         "Master: " + masterClass.toString() +
+         ((e.getCause() != null)? e.getCause().getMessage(): ""), e);
+     }
+   }
++  
++  private static UserGroupInformation loginFromKeytab(Configuration conf)
++    throws IOException {
++    String keytabFileKey = "hbase.master.keytab.file";
++    String userNameKey = "hbase.master.kerberos.principal";
++    
++    String keytabFilename = conf.get(keytabFileKey);
++    if (keytabFilename == null) {
++      if (UserGroupInformation.isSecurityEnabled()) {
++        LOG.warn("No keytab file '" + keytabFileKey + "' configured.");
++      }
++      return UserGroupInformation.getLoginUser();
++    }
++
++    String principalConfig = conf.get(userNameKey, System
++        .getProperty("user.name"));
++    String principalName = SecurityUtil.getServerPrincipal(principalConfig,
++        InetAddress.getLocalHost().getCanonicalHostName());
++
++    return UserGroupInformation.loginUserFromKeytabAndReturnUGI(
++      principalName, keytabFilename);
++  }
+ 
+   public Map<String, Integer> getTableFragmentation() throws IOException {
+     long now = System.currentTimeMillis();
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 8f0ac89..33abc5c 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -26,6 +26,7 @@ import java.lang.management.MemoryUsage;
+ import java.lang.management.RuntimeMXBean;
+ import java.lang.reflect.Constructor;
+ import java.net.BindException;
++import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -49,6 +50,8 @@ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.security.PrivilegedExceptionAction;
++import java.security.PrivilegedAction;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -106,6 +109,8 @@ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+ import org.apache.hadoop.io.MapWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.net.DNS;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.Progressable;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.zookeeper.WatchedEvent;
+@@ -241,12 +246,16 @@ public class HRegionServer implements HRegionInterface,
+   private Replication replicationHandler;
+   // End of replication
+ 
++  private final UserGroupInformation serverUser;
++
+   /**
+    * Starts a HRegionServer at the default location
+    * @param conf
+    * @throws IOException
+    */
+   public HRegionServer(Configuration conf) throws IOException {
++    serverUser = UserGroupInformation.getCurrentUser();
++
+     machineName = DNS.getDefaultHost(
+         conf.get("hbase.regionserver.dns.interface","default"),
+         conf.get("hbase.regionserver.dns.nameserver","default"));
+@@ -319,6 +328,7 @@ public class HRegionServer implements HRegionInterface,
+       throw new NullPointerException("Server address cannot be null; " +
+         "hbase-958 debugging");
+     }
++
+     reinitializeThreads();
+     reinitializeZooKeeper();
+     int nbBlocks = conf.getInt("hbase.regionserver.nbreservationblocks", 4);
+@@ -433,6 +443,15 @@ public class HRegionServer implements HRegionInterface,
+    * load/unload instructions.
+    */
+   public void run() {
++    serverUser.doAs(new PrivilegedAction<Void>() {
++        public Void run() {
++          doRun();
++          return null;
++        }
++      });
++  }
++
++  private void doRun() {
+     regionServerThread = Thread.currentThread();
+     boolean quiesceRequested = false;
+     try {
+@@ -2434,6 +2453,7 @@ public class HRegionServer implements HRegionInterface,
+   throws IOException {
+     Thread t = new Thread(hrs);
+     t.setName(name);
++
+     t.start();
+     // Install shutdown hook that will catch signals and run an orderly shutdown
+     // of the hrs.
+@@ -2451,15 +2471,48 @@ public class HRegionServer implements HRegionInterface,
+   public static HRegionServer constructRegionServer(Class<? extends HRegionServer> regionServerClass,
+       final Configuration conf2)  {
+     try {
+-      Constructor<? extends HRegionServer> c =
++      final Constructor<? extends HRegionServer> c =
+         regionServerClass.getConstructor(Configuration.class);
+-      return c.newInstance(conf2);
++      UserGroupInformation ugi = loginFromKeytab(conf2);
++      return ugi.doAs(new PrivilegedExceptionAction<HRegionServer>() {
++          public HRegionServer run() throws Exception {
++            return c.newInstance(conf2);
++          }
++        });
+     } catch (Exception e) {
+       throw new RuntimeException("Failed construction of " +
+         "Master: " + regionServerClass.toString(), e);
+     }
+   }
+ 
++  /**
++   * TODO collapse with HMaster loginFromKeytab
++   * TODO also shouldn't really be public - JVMClusterUtil is painful.
++   * These will be resolved in trunk patch
++   */
++  public static UserGroupInformation loginFromKeytab(Configuration conf)
++    throws IOException {
++    String keytabFileKey = "hbase.regionserver.keytab.file";
++    String userNameKey = "hbase.regionserver.kerberos.principal";
++    
++    String keytabFilename = conf.get(keytabFileKey);
++    if (keytabFilename == null) {
++      if (UserGroupInformation.isSecurityEnabled()) {
++        throw new IOException("No keytab file '" + keytabFileKey + "' configured.");
++      }
++      return UserGroupInformation.getLoginUser();
++    }
++
++    String principalConfig = conf.get(userNameKey, System
++        .getProperty("user.name"));
++    String principalName = SecurityUtil.getServerPrincipal(principalConfig,
++        InetAddress.getLocalHost().getCanonicalHostName());
++
++    return UserGroupInformation.loginUserFromKeytabAndReturnUGI(
++      principalName, keytabFilename);
++  }
++
++
+   @Override
+   public void replicateLogEntries(HLog.Entry[] entries) throws IOException {
+     this.replicationHandler.replicateLogEntries(entries);
+@@ -2476,4 +2529,4 @@ public class HRegionServer implements HRegionInterface,
+ 
+     new HRegionServerCommandLine(regionServerClass).doMain(args);
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/org/apache/hadoop/hbase/util/JVMClusterUtil.java b/src/main/java/org/apache/hadoop/hbase/util/JVMClusterUtil.java
+index 280b91d..cfa2ea6 100644
+--- a/src/main/java/org/apache/hadoop/hbase/util/JVMClusterUtil.java
++++ b/src/main/java/org/apache/hadoop/hbase/util/JVMClusterUtil.java
+@@ -20,13 +20,18 @@
+ package org.apache.hadoop.hbase.util;
+ 
+ import java.io.IOException;
++import java.security.PrivilegedExceptionAction;
+ import java.util.List;
++import com.google.common.base.Throwables;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.hbase.master.HMaster;
+ import org.apache.hadoop.hbase.regionserver.HRegionServer;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
++import org.apache.hadoop.security.UserGroupInformation;
+ 
+ /**
+  * Utility used running a cluster all in the one JVM.
+@@ -34,15 +39,39 @@ import org.apache.hadoop.hbase.regionserver.HRegionServer;
+ public class JVMClusterUtil {
+   private static final Log LOG = LogFactory.getLog(JVMClusterUtil.class);
+ 
++  private final static UserGroupInformation UGI;
++  static {
++    try {
++      UGI = UserGroupInformation.getCurrentUser();
++    } catch (IOException ioe) {
++      throw new RuntimeException("Error getting current user", ioe);
++    }
++  }
++
++  private static UserGroupInformation getDifferentUser(final Configuration c,
++      int index)
++  throws IOException {
++    FileSystem currentfs = FileSystem.get(c);
++    if (!(currentfs instanceof DistributedFileSystem)) return UGI;
++    // Else distributed filesystem.  Make a new instance per daemon.  Below
++    // code is taken from the AppendTestUtil over in hdfs.
++    String username = UGI.getShortUserName() + ".hrs." + index;
++    return UserGroupInformation.createUserForTesting(username,
++        new String[]{"supergroup"});
++  }
++
+   /**
+    * Datastructure to hold RegionServer Thread and RegionServer instance
+    */
+   public static class RegionServerThread extends Thread {
+     private final HRegionServer regionServer;
++    private final UserGroupInformation serverUser;
+ 
+-    public RegionServerThread(final HRegionServer r, final int index) {
++    public RegionServerThread(final HRegionServer r,
++        final UserGroupInformation ugi, final int index) {
+       super(r, "RegionServer:" + index);
+       this.regionServer = r;
++      this.serverUser = ugi;
+     }
+ 
+     /** @return the region server */
+@@ -82,15 +111,26 @@ public class JVMClusterUtil {
+   public static JVMClusterUtil.RegionServerThread createRegionServerThread(final Configuration c,
+     final Class<? extends HRegionServer> hrsc, final int index)
+   throws IOException {
+-      HRegionServer server;
+-      try {
+-        server = hrsc.getConstructor(Configuration.class).newInstance(c);
+-      } catch (Exception e) {
+-        IOException ioe = new IOException();
+-        ioe.initCause(e);
+-        throw ioe;
+-      }
+-      return new JVMClusterUtil.RegionServerThread(server, index);
++    HRegionServer server;
++    UserGroupInformation serverUser;
++    if (UserGroupInformation.isSecurityEnabled()) {
++      serverUser = HRegionServer.loginFromKeytab(c);
++    } else {
++      serverUser = getDifferentUser(c, index);
++    }
++
++    try {
++      server = serverUser.doAs( new PrivilegedExceptionAction<HRegionServer>(){
++        public HRegionServer run() throws Exception {
++          return hrsc.getConstructor(Configuration.class).newInstance(c);
++        }
++      });
++    } catch (Exception e) {
++      IOException ioe = new IOException();
++      ioe.initCause(e);
++      throw ioe;
++    }
++    return new JVMClusterUtil.RegionServerThread(server, serverUser, index);
+   }
+ 
+   /**
+diff --git a/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java b/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+index b0f132a..681e4d8 100644
+--- a/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
++++ b/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+@@ -65,7 +65,6 @@ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.mapred.MiniMRCluster;
+-import org.apache.hadoop.security.UnixUserGroupInformation;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.zookeeper.ZooKeeper;
+ 
+@@ -916,20 +915,17 @@ public class HBaseTestingUtility {
+    * @return A new configuration instance with a different user set into it.
+    * @throws IOException
+    */
+-  public static Configuration setDifferentUser(final Configuration c,
++  public static UserGroupInformation getDifferentUser(final Configuration c,
+     final String differentiatingSuffix)
+   throws IOException {
+     FileSystem currentfs = FileSystem.get(c);
+     Preconditions.checkArgument(currentfs instanceof DistributedFileSystem);
+     // Else distributed filesystem.  Make a new instance per daemon.  Below
+     // code is taken from the AppendTestUtil over in hdfs.
+-    Configuration c2 = new Configuration(c);
+-    String username = UserGroupInformation.getCurrentUGI().getUserName() +
++    String username = UserGroupInformation.getCurrentUser().getUserName() +
+       differentiatingSuffix;
+-    UnixUserGroupInformation.saveToConf(c2,
+-      UnixUserGroupInformation.UGI_PROPERTY_NAME,
+-      new UnixUserGroupInformation(username, new String[]{"supergroup"}));
+-    return c2;
++    return UserGroupInformation.createUserForTesting(username,
++        new String[]{"supergroup"});
+   }
+ 
+   /**
+diff --git a/src/test/java/org/apache/hadoop/hbase/MiniHBaseCluster.java b/src/test/java/org/apache/hadoop/hbase/MiniHBaseCluster.java
+index 9c49e36..c3c5466 100644
+--- a/src/test/java/org/apache/hadoop/hbase/MiniHBaseCluster.java
++++ b/src/test/java/org/apache/hadoop/hbase/MiniHBaseCluster.java
+@@ -20,6 +20,7 @@
+ package org.apache.hadoop.hbase;
+ 
+ import java.io.IOException;
++import java.security.PrivilegedAction;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+@@ -38,7 +39,6 @@ import org.apache.hadoop.hbase.util.JVMClusterUtil;
+ import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.io.MapWritable;
+-import org.apache.hadoop.security.UnixUserGroupInformation;
+ import org.apache.hadoop.security.UserGroupInformation;
+ 
+ /**
+@@ -51,12 +51,6 @@ public class MiniHBaseCluster {
+   static final Log LOG = LogFactory.getLog(MiniHBaseCluster.class.getName());
+   private Configuration conf;
+   public LocalHBaseCluster hbaseCluster;
+-  // Cache this.  For some reason only works first time I get it.  TODO: Figure
+-  // out why.
+-  private final static UserGroupInformation UGI;
+-  static {
+-    UGI = UserGroupInformation.getCurrentUGI();
+-  }
+ 
+   /**
+    * Start a MiniHBaseCluster.
+@@ -147,12 +141,13 @@ public class MiniHBaseCluster {
+    * the FileSystem system exit hook does.
+    */
+   public static class MiniHBaseClusterRegionServer extends HRegionServer {
+-    private static int index = 0;
+     private Thread shutdownThread = null;
++    private UserGroupInformation user = null;
+ 
+     public MiniHBaseClusterRegionServer(Configuration conf)
+         throws IOException {
+-      super(setDifferentUser(conf));
++      super(conf);
++      this.user = UserGroupInformation.getCurrentUser();
+     }
+ 
+     public void setHServerInfo(final HServerInfo hsi) {
+@@ -166,19 +161,6 @@ public class MiniHBaseCluster {
+      * @return A new fs instance if we are up on DistributeFileSystem.
+      * @throws IOException
+      */
+-    private static Configuration setDifferentUser(final Configuration c)
+-    throws IOException {
+-      FileSystem currentfs = FileSystem.get(c);
+-      if (!(currentfs instanceof DistributedFileSystem)) return c;
+-      // Else distributed filesystem.  Make a new instance per daemon.  Below
+-      // code is taken from the AppendTestUtil over in hdfs.
+-      Configuration c2 = new Configuration(c);
+-      String username = UGI.getUserName() + ".hrs." + index++;
+-      UnixUserGroupInformation.saveToConf(c2,
+-        UnixUserGroupInformation.UGI_PROPERTY_NAME,
+-        new UnixUserGroupInformation(username, new String[]{"supergroup"}));
+-      return c2;
+-    }
+ 
+     @Override
+     protected void init(MapWritable c) throws IOException {
+@@ -190,7 +172,12 @@ public class MiniHBaseCluster {
+     @Override
+     public void run() {
+       try {
+-        super.run();
++        this.user.doAs(new PrivilegedAction<Object>(){
++          public Object run() {
++            runRegionServer();
++            return null;
++          }
++        });
+       } finally {
+         // Run this on the way out.
+         if (this.shutdownThread != null) {
+@@ -200,6 +187,10 @@ public class MiniHBaseCluster {
+       }
+     }
+ 
++    private void runRegionServer() {
++      super.run();
++    }
++
+     public void kill() {
+       super.kill();
+     }
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java b/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java
+index 0b47975..0f80c00 100644
+--- a/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java
+@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.regionserver;
+ 
+ import java.io.IOException;
+ import java.lang.ref.SoftReference;
++import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Iterator;
+@@ -54,9 +55,9 @@ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManagerTestHelper;
+ import org.apache.hadoop.hbase.util.ManualEnvironmentEdge;
+-import org.apache.hadoop.security.UnixUserGroupInformation;
+ 
+ import com.google.common.base.Joiner;
++import org.apache.hadoop.security.UserGroupInformation;
+ 
+ /**
+  * Test class fosr the Store
+@@ -402,45 +403,52 @@ public class TestStore extends TestCase {
+   public void testHandleErrorsInFlush() throws Exception {
+     LOG.info("Setting up a faulty file system that cannot write");
+ 
+-    Configuration conf = HBaseConfiguration.create();
+-    // Set a different UGI so we don't get the same cached LocalFS instance
+-    conf.set(UnixUserGroupInformation.UGI_PROPERTY_NAME,
+-        "testhandleerrorsinflush,foo");
++    final Configuration conf = HBaseConfiguration.create();
+     // Inject our faulty LocalFileSystem
+     conf.setClass("fs.file.impl", FaultyFileSystem.class,
+         FileSystem.class);
+-    // Make sure it worked (above is sensitive to caching details in hadoop core)
+-    FileSystem fs = FileSystem.get(conf);
+-    assertEquals(FaultyFileSystem.class, fs.getClass());
+-
+-    // Initialize region
+-    init(getName(), conf);
+-
+-    LOG.info("Adding some data");
+-    this.store.add(new KeyValue(row, family, qf1, 1, (byte[])null));
+-    this.store.add(new KeyValue(row, family, qf2, 1, (byte[])null));
+-    this.store.add(new KeyValue(row, family, qf3, 1, (byte[])null));
+-
+-    LOG.info("Before flush, we should have no files");
+-    FileStatus[] files = fs.listStatus(store.getHomedir());
+-    Path[] paths = FileUtil.stat2Paths(files);
+-    System.err.println("Got paths: " + Joiner.on(",").join(paths));
+-    assertEquals(0, paths.length);
+-
+-    //flush
+-    try {
+-      LOG.info("Flushing");
+-      flush(1);
+-      fail("Didn't bubble up IOE!");
+-    } catch (IOException ioe) {
+-      assertTrue(ioe.getMessage().contains("Fault injected"));
+-    }
+-
+-    LOG.info("After failed flush, we should still have no files!");
+-    files = fs.listStatus(store.getHomedir());
+-    paths = FileUtil.stat2Paths(files);
+-    System.err.println("Got paths: " + Joiner.on(",").join(paths));
+-    assertEquals(0, paths.length);
++    // Set a different UGI so we don't get the same cached LocalFS instance
++    UserGroupInformation ugi = UserGroupInformation.createUserForTesting(
++        "testhandleerrorsinflush", new String[]{"foo"});
++
++    ugi.doAs(new PrivilegedExceptionAction<Object>() {
++      public Object run() throws Exception {
++        // Make sure it worked (above is sensitive to caching details in hadoop core)
++        FileSystem fs = FileSystem.get(conf);
++        assertEquals(FaultyFileSystem.class, fs.getClass());
++
++        // Initialize region
++        init(getName(), conf);
++
++        LOG.info("Adding some data");
++        store.add(new KeyValue(row, family, qf1, 1, (byte[])null));
++        store.add(new KeyValue(row, family, qf2, 1, (byte[])null));
++        store.add(new KeyValue(row, family, qf3, 1, (byte[])null));
++
++        LOG.info("Before flush, we should have no files");
++        FileStatus[] files = fs.listStatus(store.getHomedir());
++        Path[] paths = FileUtil.stat2Paths(files);
++        System.err.println("Got paths: " + Joiner.on(",").join(paths));
++        assertEquals(0, paths.length);
++
++        //flush
++        try {
++          LOG.info("Flushing");
++          flush(1);
++          fail("Didn't bubble up IOE!");
++        } catch (IOException ioe) {
++          assertTrue(ioe.getMessage().contains("Fault injected"));
++        }
++
++        LOG.info("After failed flush, we should still have no files!");
++        files = fs.listStatus(store.getHomedir());
++        paths = FileUtil.stat2Paths(files);
++        System.err.println("Got paths: " + Joiner.on(",").join(paths));
++        assertEquals(0, paths.length);
++
++        return null;
++      }
++    });
+   }
+ 
+ 
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java
+index c982662..6470ce8 100644
+--- a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java
+@@ -23,6 +23,7 @@ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.io.IOException;
++import java.security.PrivilegedExceptionAction;
+ import java.util.List;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -47,6 +48,7 @@ import org.apache.hadoop.hbase.regionserver.Store;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.EnvironmentEdge;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.junit.After;
+ import org.junit.AfterClass;
+ import org.junit.Before;
+@@ -177,10 +179,10 @@ public class TestWALReplay {
+   @Test
+   public void testRegionMadeOfBulkLoadedFilesOnly()
+   throws IOException, SecurityException, IllegalArgumentException,
+-      NoSuchFieldException, IllegalAccessException {
++      NoSuchFieldException, IllegalAccessException, InterruptedException {
+     final String tableNameStr = "testReplayEditsWrittenViaHRegion";
+-    HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
+-    Path basedir = new Path(this.hbaseRootDir, tableNameStr);
++    final HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
++    final Path basedir = new Path(this.hbaseRootDir, tableNameStr);
+     deleteDir(basedir);
+     HLog wal = createWAL(this.conf);
+     HRegion region = HRegion.openHRegion(hri, basedir, wal, this.conf);
+@@ -196,18 +198,24 @@ public class TestWALReplay {
+     wal.sync();
+ 
+     // Now 'crash' the region by stealing its wal
+-    Configuration newConf = HBaseTestingUtility.setDifferentUser(this.conf,
++    UserGroupInformation newUGI = HBaseTestingUtility.getDifferentUser(this.conf,
+         tableNameStr);
+-    runWALSplit(newConf);
+-    HLog wal2 = createWAL(newConf);
+-    HRegion region2 = new HRegion(basedir, wal2, FileSystem.get(newConf),
+-      newConf, hri, null);
+-    long seqid2 = region2.initialize();
+-    assertTrue(seqid2 > -1);
+-
+-    // I can't close wal1.  Its been appropriated when we split.
+-    region2.close();
+-    wal2.closeAndDelete();
++    newUGI.doAs(new PrivilegedExceptionAction<Object>() {
++      public Object run() throws Exception {
++        runWALSplit(conf);
++        HLog wal2 = createWAL(conf);
++        HRegion region2 = new HRegion(basedir, wal2, FileSystem.get(conf),
++          conf, hri, null);
++        long seqid2 = region2.initialize();
++        assertTrue(seqid2 > -1);
++
++        // I can't close wal1.  Its been appropriated when we split.
++        region2.close();
++        wal2.closeAndDelete();
++
++        return null;
++      }
++    });
+   }
+ 
+   /**
+@@ -222,10 +230,10 @@ public class TestWALReplay {
+   @Test
+   public void testReplayEditsWrittenViaHRegion()
+   throws IOException, SecurityException, IllegalArgumentException,
+-      NoSuchFieldException, IllegalAccessException {
++      NoSuchFieldException, IllegalAccessException, InterruptedException {
+     final String tableNameStr = "testReplayEditsWrittenViaHRegion";
+-    HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
+-    Path basedir = new Path(this.hbaseRootDir, tableNameStr);
++    final HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
++    final Path basedir = new Path(this.hbaseRootDir, tableNameStr);
+     deleteDir(basedir);
+     final byte[] rowName = Bytes.toBytes(tableNameStr);
+     final int countPerFamily = 10;
+@@ -248,7 +256,7 @@ public class TestWALReplay {
+       }
+     }
+     // Now assert edits made it in.
+-    Get g = new Get(rowName);
++    final Get g = new Get(rowName);
+     Result result = region.get(g, null);
+     assertEquals(countPerFamily * hri.getTableDesc().getFamilies().size(),
+       result.size());
+@@ -278,39 +286,44 @@ public class TestWALReplay {
+       addRegionEdits(rowName, hcd.getName(), countPerFamily, this.ee, region2, "y");
+     }
+     // Get count of edits.
+-    Result result2 = region2.get(g, null);
++    final Result result2 = region2.get(g, null);
+     assertEquals(2 * result.size(), result2.size());
+     wal2.sync();
+     // Set down maximum recovery so we dfsclient doesn't linger retrying something
+     // long gone.
+     HBaseTestingUtility.setMaxRecoveryErrorCount(wal2.getOutputStream(), 1);
+-    Configuration newConf = HBaseTestingUtility.setDifferentUser(this.conf,
++    UserGroupInformation newUGI = HBaseTestingUtility.getDifferentUser(this.conf,
+       tableNameStr);
+-    runWALSplit(newConf);
+-    FileSystem newFS = FileSystem.get(newConf);
+-    // Make a new wal for new region open.
+-    HLog wal3 = createWAL(newConf);
+-    final AtomicInteger countOfRestoredEdits = new AtomicInteger(0);
+-    HRegion region3 = new HRegion(basedir, wal3, newFS, newConf, hri, null) {
+-      @Override
+-      protected boolean restoreEdit(Store s, KeyValue kv) {
+-        boolean b = super.restoreEdit(s, kv);
+-        countOfRestoredEdits.incrementAndGet();
+-        return b;
++    newUGI.doAs(new PrivilegedExceptionAction<Object>() {
++      public Object run() throws Exception {
++        runWALSplit(conf);
++        FileSystem newFS = FileSystem.get(conf);
++        // Make a new wal for new region open.
++        HLog wal3 = createWAL(conf);
++        final AtomicInteger countOfRestoredEdits = new AtomicInteger(0);
++        HRegion region3 = new HRegion(basedir, wal3, newFS, conf, hri, null) {
++          @Override
++          protected boolean restoreEdit(Store s, KeyValue kv) {
++            boolean b = super.restoreEdit(s, kv);
++            countOfRestoredEdits.incrementAndGet();
++            return b;
++          }
++        };
++        long seqid3 = region3.initialize();
++        // HRegionServer usually does this. It knows the largest seqid across all regions.
++        wal3.setSequenceNumber(seqid3);
++        Result result3 = region3.get(g, null);
++        // Assert that count of cells is same as before crash.
++        assertEquals(result2.size(), result3.size());
++        assertEquals(hri.getTableDesc().getFamilies().size() * countPerFamily,
++          countOfRestoredEdits.get());
++
++        // I can't close wal1.  Its been appropriated when we split.
++        region3.close();
++        wal3.closeAndDelete();
++        return null;
+       }
+-    };
+-    long seqid3 = region3.initialize();
+-    // HRegionServer usually does this. It knows the largest seqid across all regions.
+-    wal3.setSequenceNumber(seqid3);
+-    Result result3 = region3.get(g, null);
+-    // Assert that count of cells is same as before crash.
+-    assertEquals(result2.size(), result3.size());
+-    assertEquals(hri.getTableDesc().getFamilies().size() * countPerFamily,
+-      countOfRestoredEdits.get());
+-
+-    // I can't close wal1.  Its been appropriated when we split.
+-    region3.close();
+-    wal3.closeAndDelete();
++    });
+   }
+ 
+   /**
+@@ -321,10 +334,10 @@ public class TestWALReplay {
+   @Test
+   public void testReplayEditsWrittenIntoWAL() throws Exception {
+     final String tableNameStr = "testReplayEditsWrittenIntoWAL";
+-    HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
+-    Path basedir = new Path(hbaseRootDir, tableNameStr);
++    final HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
++    final Path basedir = new Path(hbaseRootDir, tableNameStr);
+     deleteDir(basedir);
+-    HLog wal = createWAL(this.conf);
++    final HLog wal = createWAL(this.conf);
+     final byte[] tableName = Bytes.toBytes(tableNameStr);
+     final byte[] rowName = tableName;
+     final byte[] regionName = hri.getRegionName();
+@@ -359,41 +372,48 @@ public class TestWALReplay {
+     // long gone.
+     HBaseTestingUtility.setMaxRecoveryErrorCount(wal.getOutputStream(), 1);
+ 
+-    // Make a new conf and a new fs for the splitter to run on so we can take
++    // Make a new fs for the splitter and run as a new user so we can take
+     // over old wal.
+-    Configuration newConf = HBaseTestingUtility.setDifferentUser(this.conf,
++    UserGroupInformation newUGI = HBaseTestingUtility.getDifferentUser(this.conf,
+       ".replay.wal.secondtime");
+-    runWALSplit(newConf);
+-    FileSystem newFS = FileSystem.get(newConf);
+-    // 100k seems to make for about 4 flushes during HRegion#initialize.
+-    newConf.setInt("hbase.hregion.memstore.flush.size", 1024 * 100);
+-    // Make a new wal for new region.
+-    HLog newWal = createWAL(newConf);
+-    final AtomicInteger flushcount = new AtomicInteger(0);
+-    try {
+-      final HRegion region = new HRegion(basedir, newWal, newFS, newConf, hri,
+-          null) {
+-        protected boolean internalFlushcache(HLog wal, long myseqid)
+-        throws IOException {
+-          boolean b = super.internalFlushcache(wal, myseqid);
+-          flushcount.incrementAndGet();
+-          return b;
+-        };
+-      };
+-      long seqid = region.initialize();
+-      // We flushed during init.
+-      assertTrue(flushcount.get() > 0);
+-      assertTrue(seqid > wal.getSequenceNumber());
+-
+-      Get get = new Get(rowName);
+-      Result result = region.get(get, -1);
+-      // Make sure we only see the good edits
+-      assertEquals(countPerFamily * (hri.getTableDesc().getFamilies().size() - 1),
+-        result.size());
+-      region.close();
+-    } finally {
+-      newWal.closeAndDelete();
+-    }
++    final Configuration newConf = new Configuration(conf);
++    newUGI.doAs(new PrivilegedExceptionAction<Object>() {
++      public Object run() throws Exception {
++        runWALSplit(newConf);
++        FileSystem newFS = FileSystem.get(newConf);
++        // 100k seems to make for about 4 flushes during HRegion#initialize.
++        newConf.setInt("hbase.hregion.memstore.flush.size", 1024 * 100);
++        // Make a new wal for new region.
++        HLog newWal = createWAL(newConf);
++        final AtomicInteger flushcount = new AtomicInteger(0);
++        try {
++          final HRegion region = new HRegion(basedir, newWal, newFS, newConf, hri,
++              null) {
++            protected boolean internalFlushcache(HLog wal, long myseqid)
++            throws IOException {
++              boolean b = super.internalFlushcache(wal, myseqid);
++              flushcount.incrementAndGet();
++              return b;
++            };
++          };
++          long seqid = region.initialize();
++          // We flushed during init.
++          assertTrue(flushcount.get() > 0);
++          assertTrue(seqid > wal.getSequenceNumber());
++
++          Get get = new Get(rowName);
++          Result result = region.get(get, -1);
++          // Make sure we only see the good edits
++          assertEquals(countPerFamily * (hri.getTableDesc().getFamilies().size() - 1),
++            result.size());
++          region.close();
++        } finally {
++          newWal.closeAndDelete();
++        }
++
++        return null;
++      }
++    });
+   }
+ 
+   private void addWALEdits (final byte [] tableName, final HRegionInfo hri,
+-- 
+1.7.0.4
+

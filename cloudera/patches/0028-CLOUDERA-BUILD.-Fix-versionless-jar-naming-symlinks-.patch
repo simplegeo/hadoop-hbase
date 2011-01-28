@@ -1,0 +1,30 @@
+From 80fd13dbb5d66bdfc80e6c22f6b4567f62499c49 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Sat, 9 Oct 2010 17:56:08 -0700
+Subject: [PATCH 28/30] CLOUDERA-BUILD. Fix versionless jar naming symlinks for multijar case
+
+Ref: CDH-2203
+---
+ cloudera/install_hbase.sh |    6 ++++--
+ 1 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/cloudera/install_hbase.sh b/cloudera/install_hbase.sh
+index 247780e..86c4baf 100755
+--- a/cloudera/install_hbase.sh
++++ b/cloudera/install_hbase.sh
+@@ -99,8 +99,10 @@ cp hbase*.jar $PREFIX/$LIB_DIR/
+ 
+ # Make an unversioned jar symlink so that other
+ # packages that depend on us can link in.
+-for x in $PREFIX/hbase*jar ; do
+-  ln -s $(basename $x) $PREFIX/$LIB_DIR/hbase.jar
++for x in $PREFIX/$LIB_DIR/hbase*jar ; do
++  JARNAME=$(basename $x)
++  VERSIONLESS_NAME=$(echo $JARNAME | sed -e 's,hbase-[0-9\+\-\.]*[0-9]\(-SNAPSHOT\)*,hbase,g')
++  ln -s $JARNAME $PREFIX/$LIB_DIR/$VERSIONLESS_NAME
+ done
+ cp -a docs/* $PREFIX/$DOC_DIR
+ cp *.txt $PREFIX/$DOC_DIR/
+-- 
+1.7.0.4
+

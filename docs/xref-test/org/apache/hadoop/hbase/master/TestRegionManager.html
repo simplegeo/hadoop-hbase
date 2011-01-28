@@ -1,0 +1,93 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+<head>
+<meta http-equiv="content-type" content="text/html; charset=ISO-8859-1" />
+<title>TestRegionManager xref</title>
+<link type="text/css" rel="stylesheet" href="../../../../../stylesheet.css" />
+</head>
+<body>
+<pre>
+
+<a name="1" href="#1">1</a>   <em class="jxr_comment">/*</em>
+<a name="2" href="#2">2</a>   <em class="jxr_comment"> * Copyright 2009 The Apache Software Foundation</em>
+<a name="3" href="#3">3</a>   <em class="jxr_comment"> *</em>
+<a name="4" href="#4">4</a>   <em class="jxr_comment"> * Licensed to the Apache Software Foundation (ASF) under one</em>
+<a name="5" href="#5">5</a>   <em class="jxr_comment"> * or more contributor license agreements.  See the NOTICE file</em>
+<a name="6" href="#6">6</a>   <em class="jxr_comment"> * distributed with this work for additional information</em>
+<a name="7" href="#7">7</a>   <em class="jxr_comment"> * regarding copyright ownership.  The ASF licenses this file</em>
+<a name="8" href="#8">8</a>   <em class="jxr_comment"> * to you under the Apache License, Version 2.0 (the</em>
+<a name="9" href="#9">9</a>   <em class="jxr_comment"> * "License"); you may not use this file except in compliance</em>
+<a name="10" href="#10">10</a>  <em class="jxr_comment"> * with the License.  You may obtain a copy of the License at</em>
+<a name="11" href="#11">11</a>  <em class="jxr_comment"> *</em>
+<a name="12" href="#12">12</a>  <em class="jxr_comment"> *     <a href="http://www.apache.org/licenses/LICENSE-2.0" target="alexandria_uri">http://www.apache.org/licenses/LICENSE-2.0</a></em>
+<a name="13" href="#13">13</a>  <em class="jxr_comment"> *</em>
+<a name="14" href="#14">14</a>  <em class="jxr_comment"> * Unless required by applicable law or agreed to in writing, software</em>
+<a name="15" href="#15">15</a>  <em class="jxr_comment"> * distributed under the License is distributed on an "AS IS" BASIS,</em>
+<a name="16" href="#16">16</a>  <em class="jxr_comment"> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</em>
+<a name="17" href="#17">17</a>  <em class="jxr_comment"> * See the License for the specific language governing permissions and</em>
+<a name="18" href="#18">18</a>  <em class="jxr_comment"> * limitations under the License.</em>
+<a name="19" href="#19">19</a>  <em class="jxr_comment"> */</em>
+<a name="20" href="#20">20</a>  
+<a name="21" href="#21">21</a>  <strong class="jxr_keyword">package</strong> org.apache.hadoop.hbase.master;
+<a name="22" href="#22">22</a>  
+<a name="23" href="#23">23</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.HBaseClusterTestCase;
+<a name="24" href="#24">24</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.HConstants;
+<a name="25" href="#25">25</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.HRegionInfo;
+<a name="26" href="#26">26</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.HServerAddress;
+<a name="27" href="#27">27</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.HTableDescriptor;
+<a name="28" href="#28">28</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.client.HTable;
+<a name="29" href="#29">29</a>  <strong class="jxr_keyword">import</strong> org.apache.hadoop.hbase.util.Bytes;
+<a name="30" href="#30">30</a>  
+<a name="31" href="#31">31</a>  <strong class="jxr_keyword">public</strong> <strong class="jxr_keyword">class</strong> <a href="../../../../../org/apache/hadoop/hbase/master/TestRegionManager.html">TestRegionManager</a> <strong class="jxr_keyword">extends</strong> <a href="../../../../../org/apache/hadoop/hbase/HBaseClusterTestCase.html">HBaseClusterTestCase</a> {
+<a name="32" href="#32">32</a>     <strong class="jxr_keyword">public</strong> <strong class="jxr_keyword">void</strong> testGetFirstMetaRegionForRegionAfterMetaSplit()
+<a name="33" href="#33">33</a>     <strong class="jxr_keyword">throws</strong> Exception {
+<a name="34" href="#34">34</a>       HTable meta = <strong class="jxr_keyword">new</strong> HTable(HConstants.META_TABLE_NAME);
+<a name="35" href="#35">35</a>       HMaster master = <strong class="jxr_keyword">this</strong>.cluster.getMaster();
+<a name="36" href="#36">36</a>       HServerAddress address = master.getMasterAddress();
+<a name="37" href="#37">37</a>       HTableDescriptor tableDesc = <strong class="jxr_keyword">new</strong> HTableDescriptor(Bytes.toBytes(<span class="jxr_string">"_MY_TABLE_"</span>));
+<a name="38" href="#38">38</a>       HTableDescriptor metaTableDesc = meta.getTableDescriptor();
+<a name="39" href="#39">39</a>       <em class="jxr_comment">// master.regionManager.onlineMetaRegions already contains first .META. region at key Bytes.toBytes("")</em>
+<a name="40" href="#40">40</a>       byte[] startKey0 = Bytes.toBytes(<span class="jxr_string">"f"</span>);
+<a name="41" href="#41">41</a>       byte[] endKey0 = Bytes.toBytes(<span class="jxr_string">"h"</span>);
+<a name="42" href="#42">42</a>       HRegionInfo regionInfo0 = <strong class="jxr_keyword">new</strong> HRegionInfo(tableDesc, startKey0, endKey0);
+<a name="43" href="#43">43</a>  
+<a name="44" href="#44">44</a>       <em class="jxr_comment">// 1st .META. region will be something like .META.,,1253625700761</em>
+<a name="45" href="#45">45</a>       HRegionInfo metaRegionInfo0 = <strong class="jxr_keyword">new</strong> HRegionInfo(metaTableDesc, Bytes.toBytes(<span class="jxr_string">""</span>), regionInfo0.getRegionName());
+<a name="46" href="#46">46</a>       MetaRegion meta0 = <strong class="jxr_keyword">new</strong> MetaRegion(address, metaRegionInfo0);
+<a name="47" href="#47">47</a>  
+<a name="48" href="#48">48</a>       byte[] startKey1 = Bytes.toBytes(<span class="jxr_string">"j"</span>);
+<a name="49" href="#49">49</a>       byte[] endKey1 = Bytes.toBytes(<span class="jxr_string">"m"</span>);
+<a name="50" href="#50">50</a>       HRegionInfo regionInfo1 = <strong class="jxr_keyword">new</strong> HRegionInfo(tableDesc, startKey1, endKey1);
+<a name="51" href="#51">51</a>       <em class="jxr_comment">// 2nd .META. region will be something like .META.,_MY_TABLE_,f,1253625700761,1253625700761</em>
+<a name="52" href="#52">52</a>       HRegionInfo metaRegionInfo1 = <strong class="jxr_keyword">new</strong> HRegionInfo(metaTableDesc, regionInfo0.getRegionName(), regionInfo1.getRegionName());
+<a name="53" href="#53">53</a>       MetaRegion meta1 = <strong class="jxr_keyword">new</strong> MetaRegion(address, metaRegionInfo1);
+<a name="54" href="#54">54</a>  
+<a name="55" href="#55">55</a>  
+<a name="56" href="#56">56</a>       <em class="jxr_comment">// 3rd .META. region will be something like .META.,_MY_TABLE_,j,1253625700761,1253625700761</em>
+<a name="57" href="#57">57</a>       HRegionInfo metaRegionInfo2 = <strong class="jxr_keyword">new</strong> HRegionInfo(metaTableDesc, regionInfo1.getRegionName(), Bytes.toBytes(<span class="jxr_string">""</span>));
+<a name="58" href="#58">58</a>       MetaRegion meta2 = <strong class="jxr_keyword">new</strong> MetaRegion(address, metaRegionInfo2);
+<a name="59" href="#59">59</a>  
+<a name="60" href="#60">60</a>       byte[] startKeyX = Bytes.toBytes(<span class="jxr_string">"h"</span>);
+<a name="61" href="#61">61</a>       byte[] endKeyX = Bytes.toBytes(<span class="jxr_string">"j"</span>);
+<a name="62" href="#62">62</a>       HRegionInfo regionInfoX = <strong class="jxr_keyword">new</strong> HRegionInfo(tableDesc, startKeyX, endKeyX);
+<a name="63" href="#63">63</a>  
+<a name="64" href="#64">64</a>  
+<a name="65" href="#65">65</a>       master.getRegionManager().offlineMetaRegionWithStartKey(startKey0);
+<a name="66" href="#66">66</a>       master.getRegionManager().putMetaRegionOnline(meta0);
+<a name="67" href="#67">67</a>       master.getRegionManager().putMetaRegionOnline(meta1);
+<a name="68" href="#68">68</a>       master.getRegionManager().putMetaRegionOnline(meta2);
+<a name="69" href="#69">69</a>  
+<a name="70" href="#70">70</a>  <em class="jxr_comment">//    for (byte[] b : master.regionManager.getOnlineMetaRegions().keySet()) {</em>
+<a name="71" href="#71">71</a>  <em class="jxr_comment">//      System.out.println("FROM TEST KEY " + b +"  " +new String(b));</em>
+<a name="72" href="#72">72</a>  <em class="jxr_comment">//    }</em>
+<a name="73" href="#73">73</a>  
+<a name="74" href="#74">74</a>       assertEquals(metaRegionInfo1.getStartKey(),
+<a name="75" href="#75">75</a>         master.getRegionManager().getFirstMetaRegionForRegion(regionInfoX).getStartKey());
+<a name="76" href="#76">76</a>       assertEquals(metaRegionInfo1.getRegionName(),
+<a name="77" href="#77">77</a>        master.getRegionManager().getFirstMetaRegionForRegion(regionInfoX).getRegionName());
+<a name="78" href="#78">78</a>     }
+<a name="79" href="#79">79</a>  }
+</pre>
+<hr/><div id="footer">This page was automatically generated by <a href="http://maven.apache.org/">Maven</a></div></body>
+</html>
+
