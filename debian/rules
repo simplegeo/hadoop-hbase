@@ -47,7 +47,7 @@ install: build
 	### hbase org.jruby.Main <script>
 	find debian/tmp/usr/lib/hbase/bin debian/tmp/usr/lib/hbase/lib -name \*.rb -exec chmod 644 {} \;
 	### webapps should not be executable either
-	find debian/tmp/usr/lib/hbase/webapps -type f -exec chmod 644 {} \;
+	find debian/tmp/usr/lib/hbase/hbase-webapps -type f -exec chmod 644 {} \;
 
 	(dh_lintian) || /bin/true
 
