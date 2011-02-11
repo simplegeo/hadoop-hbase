@@ -1,3 +1,13 @@
+hadoop-hbase (0.89.20100924+30-1sg4) UNRELEASED; urgency=low
+
+  [ Jeremy Grosser ]
+  * Install hbase webapps into webapps directory
+  * Set permissions on the right dir
+
+  [ SimpleGeo Nerds ]
+
+ -- SimpleGeo Nerds <nerds@simplegeo.com>  Fri, 11 Feb 2011 18:19:05 +0000
+
 hadoop-hbase (0.89.20100924+30-1sg2) UNRELEASED; urgency=low
 
   [ Jeremy Grosser ]
