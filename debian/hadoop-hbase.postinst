@@ -13,6 +13,7 @@ case "$1" in
 		chown hbase:hbase -R /var/run/hbase /var/log/hbase
 		ln -s  /var/log/hbase /usr/lib/hbase/logs
 		ln -s  /var/run/hbase /usr/lib/hbase/pids
+		cp -r  /usr/lib/hbase/hbase-webapps /usr/lib/hbase/webapps
 
 	;;
 
