@@ -23,11 +23,10 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -45,22 +44,43 @@ import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
+import org.apache.hadoop.hbase.client.Increment;
+import org.apache.hadoop.hbase.client.MultiPut;
+import org.apache.hadoop.hbase.client.MultiPutResponse;
+import org.apache.hadoop.hbase.client.MultiAction;
+import org.apache.hadoop.hbase.client.Action;
+import org.apache.hadoop.hbase.client.MultiResponse;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.client.Row;
 import org.apache.hadoop.hbase.client.Scan;
-import org.apache.hadoop.hbase.client.MultiPutResponse;
-import org.apache.hadoop.hbase.client.MultiPut;
-import org.apache.hadoop.hbase.filter.*;
-import org.apache.hadoop.hbase.io.HbaseMapWritable;
+import org.apache.hadoop.hbase.filter.BinaryComparator;
+import org.apache.hadoop.hbase.filter.ColumnCountGetFilter;
+import org.apache.hadoop.hbase.filter.ColumnPrefixFilter;
+import org.apache.hadoop.hbase.filter.CompareFilter;
+import org.apache.hadoop.hbase.filter.DependentColumnFilter;
+import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;
+import org.apache.hadoop.hbase.filter.InclusiveStopFilter;
+import org.apache.hadoop.hbase.filter.KeyOnlyFilter;
+import org.apache.hadoop.hbase.filter.PageFilter;
+import org.apache.hadoop.hbase.filter.PrefixFilter;
+import org.apache.hadoop.hbase.filter.QualifierFilter;
+import org.apache.hadoop.hbase.filter.RowFilter;
+import org.apache.hadoop.hbase.filter.SingleColumnValueExcludeFilter;
+import org.apache.hadoop.hbase.filter.SingleColumnValueFilter;
+import org.apache.hadoop.hbase.filter.SkipFilter;
+import org.apache.hadoop.hbase.filter.ValueFilter;
+import org.apache.hadoop.hbase.filter.WhileMatchFilter;
+import org.apache.hadoop.hbase.filter.WritableByteArrayComparable;
+import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.wal.HLog;
+import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.MapWritable;
 import org.apache.hadoop.io.ObjectWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableFactories;
-import org.apache.hadoop.hbase.regionserver.HRegion;
-import org.apache.hadoop.hbase.regionserver.wal.HLog;
-import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
-import org.apache.hadoop.hbase.util.Bytes;
 
 /**
  * This is a customized version of the polymorphic hadoop
@@ -77,7 +97,7 @@ import org.apache.hadoop.hbase.util.Bytes;
  * name and reflection to instantiate class was costing in excess of the cell
  * handling).
  */
-public class HbaseObjectWritable implements Writable, Configurable {
+public class HbaseObjectWritable implements Writable, WritableWithSize, Configurable {
   protected final static Log LOG = LogFactory.getLog(HbaseObjectWritable.class);
 
   // Here we maintain two static maps of classes to code and vice versa.
@@ -169,9 +189,21 @@ public class HbaseObjectWritable implements Writable, Configurable {
     addToMap(HLog.Entry[].class, code++);
     addToMap(HLogKey.class, code++);
 
-    // List
     addToMap(List.class, code++);
+
+    addToMap(NavigableSet.class, code++);
     addToMap(ColumnPrefixFilter.class, code++);
+
+    // Multi
+    addToMap(Row.class, code++);
+    addToMap(Action.class, code++);
+    addToMap(MultiAction.class, code++);
+    addToMap(MultiResponse.class, code++);
+
+    addToMap(Increment.class, code++);
+
+    addToMap(KeyOnlyFilter.class, code++);
+
   }
 
   private Class<?> declaredClass;
@@ -231,6 +263,10 @@ public class HbaseObjectWritable implements Writable, Configurable {
     writeObject(out, instance, declaredClass, conf);
   }
 
+  public long getWritableSize() {
+    return getWritableSize(instance, declaredClass, conf);
+  }
+
   private static class NullInstance extends Configured implements Writable {
     Class<?> declaredClass;
     /** default constructor for writable */
@@ -268,6 +304,9 @@ public class HbaseObjectWritable implements Writable, Configurable {
       if ( List.class.isAssignableFrom(c)) {
         code = CLASS_TO_CODE.get(List.class);
       }
+      else if (Writable.class.isAssignableFrom(c)) {
+        code = CLASS_TO_CODE.get(Writable.class);
+      }
     }
     if (code == null) {
       LOG.error("Unsupported type " + c);
@@ -282,6 +321,27 @@ public class HbaseObjectWritable implements Writable, Configurable {
     out.writeByte(code);
   }
 
+
+  public static long getWritableSize(Object instance, Class declaredClass,
+                                     Configuration conf) {
+    long size = Bytes.SIZEOF_BYTE; // code
+    if (instance == null) {
+      return 0L;
+    }
+
+    if (declaredClass.isArray()) {
+      if (declaredClass.equals(Result[].class)) {
+
+        return size + Result.getWriteArraySize((Result[])instance);
+      }
+    }
+    if (declaredClass.equals(Result.class)) {
+      Result r = (Result) instance;
+      // one extra class code for writable instance.
+      return r.getWritableSize() + size + Bytes.SIZEOF_BYTE;
+    }
+    return 0L; // no hint is the default.
+  }
   /**
    * Write a {@link Writable}, {@link String}, primitive type, or an array of
    * the preceding.

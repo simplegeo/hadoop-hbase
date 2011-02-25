@@ -19,126 +19,158 @@
  */
 package org.apache.hadoop.hbase.client;
 
+import java.io.IOException;
+import java.lang.reflect.UndeclaredThrowableException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HServerAddress;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.MasterAddressTracker;
 import org.apache.hadoop.hbase.MasterNotRunningException;
-import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.TableNotFoundException;
+import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
 import org.apache.hadoop.hbase.ipc.HBaseRPC;
 import org.apache.hadoop.hbase.ipc.HBaseRPCProtocolVersion;
 import org.apache.hadoop.hbase.ipc.HMasterInterface;
 import org.apache.hadoop.hbase.ipc.HRegionInterface;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.util.MetaUtils;
+import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.SoftValueSortedMap;
 import org.apache.hadoop.hbase.util.Writables;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+import org.apache.hadoop.hbase.zookeeper.RootRegionTracker;
+import org.apache.hadoop.hbase.zookeeper.ZKTable;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.ipc.RemoteException;
-import org.apache.zookeeper.WatchedEvent;
-import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.Watcher.Event.KeeperState;
-
-import java.io.IOException;
-import java.lang.reflect.UndeclaredThrowableException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.CopyOnWriteArraySet;
+import org.apache.zookeeper.KeeperException;
 
 /**
- * A non-instantiable class that manages connections to multiple tables in
- * multiple HBase instances.
+ * A non-instantiable class that manages {@link HConnection}s.
+ * This class has a static Map of {@link HConnection} instances keyed by
+ * {@link Configuration}; all invocations of {@link #getConnection(Configuration)}
+ * that pass the same {@link Configuration} instance will be returned the same
+ * {@link  HConnection} instance (Adding properties to a Configuration
+ * instance does not change its object identity).  Sharing {@link HConnection}
+ * instances is usually what you want; all clients of the {@link HConnection}
+ * instances share the HConnections' cache of Region locations rather than each
+ * having to discover for itself the location of meta, root, etc.  It makes
+ * sense for the likes of the pool of HTables class {@link HTablePool}, for
+ * instance (If concerned that a single {@link HConnection} is insufficient
+ * for sharing amongst clients in say an heavily-multithreaded environment,
+ * in practise its not proven to be an issue.  Besides, {@link HConnection} is
+ * implemented atop Hadoop RPC and as of this writing, Hadoop RPC does a
+ * connection per cluster-member, exclusively).
  *
- * Used by {@link HTable} and {@link HBaseAdmin}
+ * <p>But sharing connections
+ * makes clean up of {@link HConnection} instances a little awkward.  Currently,
+ * clients cleanup by calling
+ * {@link #deleteConnection(Configuration, boolean)}.  This will shutdown the
+ * zookeeper connection the HConnection was using and clean up all
+ * HConnection resources as well as stopping proxies to servers out on the
+ * cluster. Not running the cleanup will not end the world; it'll
+ * just stall the closeup some and spew some zookeeper connection failed
+ * messages into the log.  Running the cleanup on a {@link HConnection} that is
+ * subsequently used by another will cause breakage so be careful running
+ * cleanup.
+ * <p>To create a {@link HConnection} that is not shared by others, you can
+ * create a new {@link Configuration} instance, pass this new instance to
+ * {@link #getConnection(Configuration)}, and then when done, close it up by
+ * doing something like the following:
+ * <pre>
+ * {@code
+ * Configuration newConfig = new Configuration(originalConf);
+ * HConnection connection = HConnectionManager.getConnection(newConfig);
+ * // Use the connection to your hearts' delight and then when done...
+ * HConnectionManager.deleteConnection(newConfig, true);
+ * }
+ * </pre>
+ * <p>Cleanup used to be done inside in a shutdown hook.  On startup we'd
+ * register a shutdown hook that called {@link #deleteAllConnections(boolean)}
+ * on its way out but the order in which shutdown hooks run is not defined so
+ * were problematic for clients of HConnection that wanted to register their
+ * own shutdown hooks so we removed ours though this shifts the onus for
+ * cleanup to the client.
  */
 @SuppressWarnings("serial")
 public class HConnectionManager {
-  // Register a shutdown hook, one that cleans up RPC and closes zk sessions.
-  static {
-    Runtime.getRuntime().addShutdownHook(new Thread("HCM.shutdownHook") {
+  static final int MAX_CACHED_HBASE_INSTANCES = 31;
+
+  // A LRU Map of Configuration hashcode -> TableServers. We set instances to 31.
+  // The zk default max connections to the ensemble from the one client is 30 so
+  // should run into zk issues before hit this value of 31.
+  private static final Map<Configuration, HConnectionImplementation> HBASE_INSTANCES =
+    new LinkedHashMap<Configuration, HConnectionImplementation>
+      ((int) (MAX_CACHED_HBASE_INSTANCES/0.75F)+1, 0.75F, true) {
       @Override
-      public void run() {
-        HConnectionManager.deleteAllConnections(true);
+      protected boolean removeEldestEntry(Map.Entry<Configuration, HConnectionImplementation> eldest) {
+        return size() > MAX_CACHED_HBASE_INSTANCES;
       }
-    });
-  }
+  };
 
   /*
-   * Not instantiable.
+   * Non-instantiable.
    */
   protected HConnectionManager() {
     super();
   }
 
-  private static final int MAX_CACHED_HBASE_INSTANCES=31;
-  // A LRU Map of master HBaseConfiguration -> connection information for that
-  // instance. The objects it contains are mutable and hence require
-  // synchronized access to them.  We set instances to 31.  The zk default max
-  // connections is 30 so should run into zk issues before hit this value of 31.
-  private static
-  final Map<Integer, TableServers> HBASE_INSTANCES =
-    new LinkedHashMap<Integer, TableServers>
-      ((int) (MAX_CACHED_HBASE_INSTANCES/0.75F)+1, 0.75F, true) {
-      @Override
-      protected boolean removeEldestEntry(Map.Entry<Integer, TableServers> eldest) {
-        return size() > MAX_CACHED_HBASE_INSTANCES;
-      }
-  };
-
-  private static final Map<String, ClientZKWatcher> ZK_WRAPPERS =
-    new HashMap<String, ClientZKWatcher>();
-
   /**
-   * Get the connection object for the instance specified by the configuration
-   * If no current connection exists, create a new connection for that instance
+   * Get the connection that goes with the passed <code>conf</code>
+   * configuration instance.
+   * If no current connection exists, method creates a new connection for the
+   * passed <code>conf</code> instance.
    * @param conf configuration
-   * @return HConnection object for the instance specified by the configuration
+   * @return HConnection object for <code>conf</code>
+   * @throws ZooKeeperConnectionException
    */
-  public static HConnection getConnection(Configuration conf) {
-    TableServers connection;
-    Integer key = HBaseConfiguration.hashCode(conf);
+  public static HConnection getConnection(Configuration conf)
+  throws ZooKeeperConnectionException {
+    HConnectionImplementation connection;
     synchronized (HBASE_INSTANCES) {
-      connection = HBASE_INSTANCES.get(key);
+      connection = HBASE_INSTANCES.get(conf);
       if (connection == null) {
-        connection = new TableServers(conf);
-        HBASE_INSTANCES.put(key, connection);
+        connection = new HConnectionImplementation(conf);
+        HBASE_INSTANCES.put(conf, connection);
       }
     }
     return connection;
   }
 
   /**
-   * Delete connection information for the instance specified by configuration
-   * @param conf configuration
-   * @param stopProxy stop the proxy as well
+   * Delete connection information for the instance specified by configuration.
+   * This will close connection to the zookeeper ensemble and let go of all
+   * resources.
+   * @param conf configuration whose identity is used to find {@link HConnection}
+   * instance.
+   * @param stopProxy Shuts down all the proxy's put up to cluster members
+   * including to cluster HMaster.  Calls {@link HBaseRPC#stopProxy(org.apache.hadoop.ipc.VersionedProtocol)}.
    */
-  public static void deleteConnectionInfo(Configuration conf,
-      boolean stopProxy) {
+  public static void deleteConnection(Configuration conf, boolean stopProxy) {
     synchronized (HBASE_INSTANCES) {
-      Integer key = HBaseConfiguration.hashCode(conf);
-      TableServers t = HBASE_INSTANCES.remove(key);
+      HConnectionImplementation t = HBASE_INSTANCES.remove(conf);
       if (t != null) {
         t.close(stopProxy);
       }
@@ -148,98 +180,14 @@ public class HConnectionManager {
   /**
    * Delete information for all connections.
    * @param stopProxy stop the proxy as well
+   * @throws IOException
    */
   public static void deleteAllConnections(boolean stopProxy) {
     synchronized (HBASE_INSTANCES) {
-      for (TableServers t : HBASE_INSTANCES.values()) {
+      for (HConnectionImplementation t : HBASE_INSTANCES.values()) {
         if (t != null) {
           t.close(stopProxy);
         }
-      }
-    }
-    synchronized (ZK_WRAPPERS) {
-      for (ClientZKWatcher watch : ZK_WRAPPERS.values()) {
-        watch.resetZooKeeper();
-      }
-    }
-  }
-
-  /**
-   * Get a watcher of a zookeeper connection for a given quorum address.
-   * If the connection isn't established, a new one is created.
-   * This acts like a multiton.
-   * @param conf configuration
-   * @return ZKW watcher
-   * @throws IOException if a remote or network exception occurs
-   */
-  public static synchronized ClientZKWatcher getClientZooKeeperWatcher(
-      Configuration conf) throws IOException {
-    if (!ZK_WRAPPERS.containsKey(
-        ZooKeeperWrapper.getZookeeperClusterKey(conf))) {
-      ZK_WRAPPERS.put(ZooKeeperWrapper.getZookeeperClusterKey(conf),
-          new ClientZKWatcher(conf));
-    }
-    return ZK_WRAPPERS.get(ZooKeeperWrapper.getZookeeperClusterKey(conf));
-  }
-
-  /**
-   * This class is responsible to handle connection and reconnection
-   * to a zookeeper quorum.
-   *
-   */
-  public static class ClientZKWatcher implements Watcher {
-
-    static final Log LOG = LogFactory.getLog(ClientZKWatcher.class);
-    private ZooKeeperWrapper zooKeeperWrapper;
-    private Configuration conf;
-
-    /**
-     * Takes a configuration to pass it to ZKW but won't instanciate it
-     * @param conf configuration
-     */
-    public ClientZKWatcher(Configuration conf) {
-      this.conf = conf;
-    }
-
-    /**
-     * Called by ZooKeeper when an event occurs on our connection. We use this to
-     * detect our session expiring. When our session expires, we have lost our
-     * connection to ZooKeeper. Our handle is dead, and we need to recreate it.
-     *
-     * See http://hadoop.apache.org/zookeeper/docs/current/zookeeperProgrammers.html#ch_zkSessions
-     * for more information.
-     *
-     * @param event WatchedEvent witnessed by ZooKeeper.
-     */
-    public void process(final WatchedEvent event) {
-      final KeeperState state = event.getState();
-      if (!state.equals(KeeperState.SyncConnected)) {
-        LOG.warn("No longer connected to ZooKeeper, current state: " + state);
-        resetZooKeeper();
-      }
-    }
-
-    /**
-     * Get this watcher's ZKW, instantiate it if necessary.
-     * @return ZKW
-     * @throws java.io.IOException if a remote or network exception occurs
-     */
-    public synchronized ZooKeeperWrapper getZooKeeperWrapper() throws IOException {
-      if (zooKeeperWrapper == null) {
-        zooKeeperWrapper =
-            ZooKeeperWrapper.createInstance(conf, HConnectionManager.class.getName());
-        zooKeeperWrapper.registerListener(this);
-      }
-      return zooKeeperWrapper;
-    }
-
-    /**
-     * Clear this connection to zookeeper.
-     */
-    private synchronized void resetZooKeeper() {
-      if (zooKeeperWrapper != null) {
-        zooKeeperWrapper.close();
-        zooKeeperWrapper = null;
       }
     }
   }
@@ -248,10 +196,12 @@ public class HConnectionManager {
    * It is provided for unit test cases which verify the behavior of region
    * location cache prefetch.
    * @return Number of cached regions for the table.
+   * @throws ZooKeeperConnectionException
    */
   static int getCachedRegionCount(Configuration conf,
-      byte[] tableName) {
-    TableServers connection = (TableServers)getConnection(conf);
+      byte[] tableName)
+  throws ZooKeeperConnectionException {
+    HConnectionImplementation connection = (HConnectionImplementation)getConnection(conf);
     return connection.getNumberOfCachedRegionLocations(tableName);
   }
 
@@ -259,41 +209,48 @@ public class HConnectionManager {
    * It's provided for unit test cases which verify the behavior of region
    * location cache prefetch.
    * @return true if the region where the table and row reside is cached.
+   * @throws ZooKeeperConnectionException
    */
   static boolean isRegionCached(Configuration conf,
-      byte[] tableName, byte[] row) {
-    TableServers connection = (TableServers)getConnection(conf);
+      byte[] tableName, byte[] row) throws ZooKeeperConnectionException {
+    HConnectionImplementation connection = (HConnectionImplementation)getConnection(conf);
     return connection.isRegionCached(tableName, row);
   }
 
-  /* Encapsulates finding the servers for an HBase instance */
-  static class TableServers implements ServerConnection {
-    static final Log LOG = LogFactory.getLog(TableServers.class);
+  /* Encapsulates connection to zookeeper and regionservers.*/
+  static class HConnectionImplementation implements HConnection {
+    static final Log LOG = LogFactory.getLog(HConnectionImplementation.class);
     private final Class<? extends HRegionInterface> serverInterfaceClass;
     private final long pause;
     private final int numRetries;
     private final int maxRPCAttempts;
-    private final long rpcTimeout;
+    private final int rpcTimeout;
     private final int prefetchRegionLimit;
 
     private final Object masterLock = new Object();
     private volatile boolean closed;
     private volatile HMasterInterface master;
     private volatile boolean masterChecked;
-
-    private final Object rootRegionLock = new Object();
+    // ZooKeeper reference
+    private ZooKeeperWatcher zooKeeper;
+    // ZooKeeper-based master address tracker
+    private MasterAddressTracker masterAddressTracker;
+    private RootRegionTracker rootRegionTracker;
+    
     private final Object metaRegionLock = new Object();
+
     private final Object userRegionLock = new Object();
 
-    private volatile Configuration conf;
-
+    private final Configuration conf;
     // Known region HServerAddress.toString() -> HRegionInterface
+
     private final Map<String, HRegionInterface> servers =
       new ConcurrentHashMap<String, HRegionInterface>();
 
-    // Used by master and region servers during safe mode only
-    private volatile HRegionLocation rootRegionLocation;
-
+    /**
+     * Map of table to table {@link HRegionLocation}s.  The table key is made
+     * by doing a {@link Bytes#mapKey(byte[])} of the table's name.
+     */
     private final Map<Integer, SoftValueSortedMap<byte [], HRegionLocation>>
       cachedRegionLocations =
         new HashMap<Integer, SoftValueSortedMap<byte [], HRegionLocation>>();
@@ -308,19 +265,15 @@ public class HConnectionManager {
      * @param conf Configuration object
      */
     @SuppressWarnings("unchecked")
-    public TableServers(Configuration conf) {
+    public HConnectionImplementation(Configuration conf)
+    throws ZooKeeperConnectionException {
       this.conf = conf;
-
-      String serverClassName =
-        conf.get(HConstants.REGION_SERVER_CLASS,
-            HConstants.DEFAULT_REGION_SERVER_CLASS);
-
+      String serverClassName = conf.get(HConstants.REGION_SERVER_CLASS,
+        HConstants.DEFAULT_REGION_SERVER_CLASS);
       this.closed = false;
-
       try {
         this.serverInterfaceClass =
           (Class<? extends HRegionInterface>) Class.forName(serverClassName);
-
       } catch (ClassNotFoundException e) {
         throw new UnsupportedOperationException(
             "Unable to find region server interface " + serverClassName, e);
@@ -329,44 +282,62 @@ public class HConnectionManager {
       this.pause = conf.getLong("hbase.client.pause", 1000);
       this.numRetries = conf.getInt("hbase.client.retries.number", 10);
       this.maxRPCAttempts = conf.getInt("hbase.client.rpc.maxattempts", 1);
-      this.rpcTimeout = conf.getLong(
-          HConstants.HBASE_REGIONSERVER_LEASE_PERIOD_KEY,
-          HConstants.DEFAULT_HBASE_REGIONSERVER_LEASE_PERIOD);
+      this.rpcTimeout = conf.getInt(
+          HConstants.HBASE_RPC_TIMEOUT_KEY,
+          HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
 
       this.prefetchRegionLimit = conf.getInt("hbase.client.prefetch.limit",
           10);
+
+      setupZookeeperTrackers();
 
       this.master = null;
       this.masterChecked = false;
     }
 
+    private synchronized void setupZookeeperTrackers()
+        throws ZooKeeperConnectionException{
+      // initialize zookeeper and master address manager
+      this.zooKeeper = getZooKeeperWatcher();
+      masterAddressTracker = new MasterAddressTracker(this.zooKeeper, this);
+      zooKeeper.registerListener(masterAddressTracker);
+      masterAddressTracker.start();
+
+      this.rootRegionTracker = new RootRegionTracker(this.zooKeeper, this);
+      this.rootRegionTracker.start();
+    }
+
+    private synchronized void resetZooKeeperTrackers()
+        throws ZooKeeperConnectionException {
+      LOG.info("Trying to reconnect to zookeeper");
+      masterAddressTracker.stop();
+      masterAddressTracker = null;
+      rootRegionTracker.stop();
+      rootRegionTracker = null;
+      this.zooKeeper = null;
+      setupZookeeperTrackers();
+    }
+
+    public Configuration getConfiguration() {
+      return this.conf;
+    }
+
     private long getPauseTime(int tries) {
       int ntries = tries;
-      if (ntries >= HConstants.RETRY_BACKOFF.length)
+      if (ntries >= HConstants.RETRY_BACKOFF.length) {
         ntries = HConstants.RETRY_BACKOFF.length - 1;
+      }
       return this.pause * HConstants.RETRY_BACKOFF[ntries];
     }
 
-    // Used by master and region servers during safe mode only
-    public void unsetRootRegionLocation() {
-      this.rootRegionLocation = null;
-    }
+    public HMasterInterface getMaster()
+    throws MasterNotRunningException, ZooKeeperConnectionException {
 
-    // Used by master and region servers during safe mode only
-    public void setRootRegionLocation(HRegionLocation rootRegion) {
-      if (rootRegion == null) {
-        throw new IllegalArgumentException(
-            "Cannot set root region location to null.");
-      }
-      this.rootRegionLocation = rootRegion;
-    }
-
-    public HMasterInterface getMaster() throws MasterNotRunningException {
-      ZooKeeperWrapper zk;
-      try {
-        zk = getZooKeeperWrapper();
-      } catch (IOException e) {
-        throw new MasterNotRunningException(e);
+      // Check if we already have a good master connection
+      if (master != null) {
+        if (master.isMasterRunning()) {
+          return master;
+        }
       }
 
       HServerAddress masterLocation = null;
@@ -378,11 +349,15 @@ public class HConnectionManager {
         tries++) {
 
           try {
-            masterLocation = zk.readMasterAddressOrThrow();
+            masterLocation = masterAddressTracker.getMasterAddress();
+            if(masterLocation == null) {
+              LOG.info("ZooKeeper available but no active master location found");
+              throw new MasterNotRunningException();
+            }
 
             HMasterInterface tryMaster = (HMasterInterface)HBaseRPC.getProxy(
                 HMasterInterface.class, HBaseRPCProtocolVersion.versionID,
-                masterLocation.getInetSocketAddress(), this.conf);
+                masterLocation.getInetSocketAddress(), this.conf, this.rpcTimeout);
 
             if (tryMaster.isMasterRunning()) {
               this.master = tryMaster;
@@ -406,7 +381,8 @@ public class HConnectionManager {
           try {
             this.masterLock.wait(getPauseTime(tries));
           } catch (InterruptedException e) {
-            // continue
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Thread was interrupted while trying to connect to master.");
           }
         }
         this.masterChecked = true;
@@ -420,48 +396,16 @@ public class HConnectionManager {
       return this.master;
     }
 
-    public boolean isMasterRunning() {
+    public boolean isMasterRunning()
+    throws MasterNotRunningException, ZooKeeperConnectionException {
       if (this.master == null) {
-        try {
-          getMaster();
-
-        } catch (MasterNotRunningException e) {
-          return false;
-        }
+        getMaster();
       }
-      return true;
-    }
-
-    public boolean tableExists(final byte [] tableName)
-    throws MasterNotRunningException {
-      getMaster();
-      if (tableName == null) {
-        throw new IllegalArgumentException("Table name cannot be null");
-      }
-      if (isMetaTableName(tableName)) {
+      boolean isRunning = master.isMasterRunning();
+      if(isRunning) {
         return true;
       }
-      boolean exists = false;
-      try {
-        HTableDescriptor[] tables = listTables();
-        for (HTableDescriptor table : tables) {
-          if (Bytes.equals(table.getName(), tableName)) {
-            exists = true;
-          }
-        }
-      } catch (IOException e) {
-        LOG.warn("Testing for table existence threw exception", e);
-      }
-      return exists;
-    }
-
-    /*
-     * @param n
-     * @return Truen if passed tablename <code>n</code> is equal to the name
-     * of a catalog table.
-     */
-    private static boolean isMetaTableName(final byte [] n) {
-      return MetaUtils.isMetaTableName(n);
+      throw new MasterNotRunningException();
     }
 
     public HRegionLocation getRegionLocation(final byte [] name,
@@ -471,7 +415,6 @@ public class HConnectionManager {
     }
 
     public HTableDescriptor[] listTables() throws IOException {
-      getMaster();
       final TreeSet<HTableDescriptor> uniqueTables =
         new TreeSet<HTableDescriptor>();
       MetaScannerVisitor visitor = new MetaScannerVisitor() {
@@ -495,7 +438,6 @@ public class HConnectionManager {
         }
       };
       MetaScanner.metaScan(conf, visitor);
-
       return uniqueTables.toArray(new HTableDescriptor[uniqueTables.size()]);
     }
 
@@ -533,69 +475,23 @@ public class HConnectionManager {
     }
 
     /*
-     * If online == true
-     *   Returns true if all regions are online
-     *   Returns false in any other case
-     * If online == false
-     *   Returns true if all regions are offline
-     *   Returns false in any other case
+     * @param True if table is online
      */
-    private boolean testTableOnlineState(byte[] tableName, boolean online)
+    private boolean testTableOnlineState(byte [] tableName, boolean online)
     throws IOException {
-      if (!tableExists(tableName)) {
-        throw new TableNotFoundException(Bytes.toString(tableName));
-      }
       if (Bytes.equals(tableName, HConstants.ROOT_TABLE_NAME)) {
         // The root region is always enabled
-        return true;
+        return online;
       }
-      int rowsScanned = 0;
-      int rowsOffline = 0;
-      byte[] startKey =
-        HRegionInfo.createRegionName(tableName, null, HConstants.ZEROES, false);
-      byte[] endKey;
-      HRegionInfo currentRegion;
-      Scan scan = new Scan(startKey);
-      scan.addColumn(HConstants.CATALOG_FAMILY,
-          HConstants.REGIONINFO_QUALIFIER);
-      int rows = this.conf.getInt("hbase.meta.scanner.caching", 100);
-      scan.setCaching(rows);
-      ScannerCallable s = new ScannerCallable(this,
-          (Bytes.equals(tableName, HConstants.META_TABLE_NAME) ?
-              HConstants.ROOT_TABLE_NAME : HConstants.META_TABLE_NAME), scan);
+      String tableNameStr = Bytes.toString(tableName);
       try {
-        // Open scanner
-        getRegionServerWithRetries(s);
-        do {
-          currentRegion = s.getHRegionInfo();
-          Result r;
-          Result [] rrs;
-          while ((rrs = getRegionServerWithRetries(s)) != null && rrs.length > 0) {
-            r = rrs[0];
-            byte [] value = r.getValue(HConstants.CATALOG_FAMILY,
-              HConstants.REGIONINFO_QUALIFIER);
-            if (value != null) {
-              HRegionInfo info = Writables.getHRegionInfoOrNull(value);
-              if (info != null) {
-                if (Bytes.equals(info.getTableDesc().getName(), tableName)) {
-                  rowsScanned += 1;
-                  rowsOffline += info.isOffline() ? 1 : 0;
-                }
-              }
-            }
-          }
-          endKey = currentRegion.getEndKey();
-        } while (!(endKey == null ||
-            Bytes.equals(endKey, HConstants.EMPTY_BYTE_ARRAY)));
-      } finally {
-        s.setClose();
-        // Doing below will call 'next' again and this will close the scanner
-        // Without it we leave scanners open.
-        getRegionServerWithRetries(s);
+        if (online) {
+          return ZKTable.isEnabledTable(this.zooKeeper, tableNameStr);
+        }
+        return ZKTable.isDisabledTable(this.zooKeeper, tableNameStr);
+      } catch (KeeperException e) {
+        throw new IOException("Enable/Disable failed", e);
       }
-      LOG.debug("Rowscanned=" + rowsScanned + ", rowsOffline=" + rowsOffline);
-      boolean onOffLine = online? rowsOffline == 0: rowsOffline == rowsScanned;
-      return rowsScanned > 0 && onOffLine;
     }
 
     private static class HTableDescriptorFinder
@@ -606,9 +502,10 @@ public class HConnectionManager {
           this.tableName = tableName;
         }
         public boolean processRow(Result rowResult) throws IOException {
-          HRegionInfo info = Writables.getHRegionInfo(
+          HRegionInfo info = Writables.getHRegionInfoOrNull(
               rowResult.getValue(HConstants.CATALOG_FAMILY,
                   HConstants.REGIONINFO_QUALIFIER));
+          if (info == null) return true;
           HTableDescriptor desc = info.getTableDesc();
           if (Bytes.compareTo(desc.getName(), tableName) == 0) {
             result = desc;
@@ -638,6 +535,20 @@ public class HConnectionManager {
       return result;
     }
 
+    @Override
+    public HRegionLocation locateRegion(final byte [] regionName)
+    throws IOException {
+      // TODO implement.  use old stuff or new stuff?
+      return null;
+    }
+
+    @Override
+    public List<HRegionLocation> locateRegions(final byte [] tableName)
+    throws IOException {
+      // TODO implement.  use old stuff or new stuff?
+      return null;
+    }
+
     public HRegionLocation locateRegion(final byte [] tableName,
         final byte [] row)
     throws IOException{
@@ -652,22 +563,24 @@ public class HConnectionManager {
 
     private HRegionLocation locateRegion(final byte [] tableName,
       final byte [] row, boolean useCache)
-    throws IOException{
+    throws IOException {
+      if (this.closed) throw new IOException(toString() + " closed");
       if (tableName == null || tableName.length == 0) {
         throw new IllegalArgumentException(
             "table name cannot be null or zero length");
       }
 
       if (Bytes.equals(tableName, HConstants.ROOT_TABLE_NAME)) {
-        synchronized (rootRegionLock) {
-          // This block guards against two threads trying to find the root
-          // region at the same time. One will go do the find while the
-          // second waits. The second thread will not do find.
-
-          if (!useCache || rootRegionLocation == null) {
-            this.rootRegionLocation = locateRootRegion();
-          }
-          return this.rootRegionLocation;
+        try {
+          HServerAddress hsa =
+            this.rootRegionTracker.waitRootRegionLocation(this.rpcTimeout);
+          LOG.debug("Lookedup root region location, connection=" + this +
+            "; hsa=" + hsa);
+          if (hsa == null) return null;
+          return new HRegionLocation(HRegionInfo.ROOT_REGIONINFO, hsa);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return null;
         }
       } else if (Bytes.equals(tableName, HConstants.META_TABLE_NAME)) {
         return locateRegionInMeta(HConstants.ROOT_TABLE_NAME, tableName, row,
@@ -732,7 +645,7 @@ public class HConnectionManager {
         MetaScanner.metaScan(conf, visitor, tableName, row,
             this.prefetchRegionLimit);
       } catch (IOException e) {
-        LOG.warn("Encounted problems when prefetch META table: ", e);
+        LOG.warn("Encountered problems when prefetch META table: ", e);
       }
     }
 
@@ -765,9 +678,12 @@ public class HConnectionManager {
             + Bytes.toStringBinary(row) + " after " + numRetries + " tries.");
         }
 
+        HRegionLocation metaLocation = null;
         try {
           // locate the root or meta region
-          HRegionLocation metaLocation = locateRegion(parentTable, metaKey);
+          metaLocation = locateRegion(parentTable, metaKey);
+          // If null still, go around again.
+          if (metaLocation == null) continue;
           HRegionInterface server =
             getHRegionConnection(metaLocation.getServerAddress());
 
@@ -852,7 +768,10 @@ public class HConnectionManager {
           }
           if (tries < numRetries - 1) {
             if (LOG.isDebugEnabled()) {
-              LOG.debug("locateRegionInMeta attempt " + tries + " of " +
+              LOG.debug("locateRegionInMeta parentTable=" +
+                Bytes.toString(parentTable) + ", metaLocation=" +
+                ((metaLocation == null)? "null": metaLocation) + ", attempt=" +
+                tries + " of " +
                 this.numRetries + " failed; retrying after sleep of " +
                 getPauseTime(tries) + " because: " + e.getMessage());
             }
@@ -867,8 +786,10 @@ public class HConnectionManager {
         }
         try{
           Thread.sleep(getPauseTime(tries));
-        } catch (InterruptedException e){
-          // continue
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException("Giving up trying to location region in " +
+            "meta: thread is interrupted.");
         }
       }
     }
@@ -942,16 +863,15 @@ public class HConnectionManager {
       return null;
     }
 
-    /*
-     * Delete a cached location, if it satisfies the table name and row
-     * requirements.
+    /**
+     * Delete a cached location
+     * @param tableName tableName
+     * @param row
      */
-    void deleteCachedLocation(final byte [] tableName,
-                                      final byte [] row) {
+    void deleteCachedLocation(final byte [] tableName, final byte [] row) {
       synchronized (this.cachedRegionLocations) {
         SoftValueSortedMap<byte [], HRegionLocation> tableLocations =
             getTableLocations(tableName);
-
         // start to examine the cache. we can only do cache actions
         // if there's something in the cache for this table.
         if (!tableLocations.isEmpty()) {
@@ -960,9 +880,9 @@ public class HConnectionManager {
             tableLocations.remove(rl.getRegionInfo().getStartKey());
             if (LOG.isDebugEnabled()) {
               LOG.debug("Removed " +
-                  rl.getRegionInfo().getRegionNameAsString() +
-                  " for tableName=" + Bytes.toString(tableName) +
-                  " from cache " + "because of " + Bytes.toStringBinary(row));
+                rl.getRegionInfo().getRegionNameAsString() +
+                " for tableName=" + Bytes.toString(tableName) +
+                " from cache " + "because of " + Bytes.toStringBinary(row));
             }
           }
         }
@@ -990,11 +910,18 @@ public class HConnectionManager {
       return result;
     }
 
-    /**
-     * Allows flushing the region cache.
-     */
+    @Override
     public void clearRegionCache() {
-     cachedRegionLocations.clear();
+      synchronized(this.cachedRegionLocations) {
+        this.cachedRegionLocations.clear();
+      }
+    }
+
+    @Override
+    public void clearRegionCache(final byte [] tableName) {
+      synchronized (this.cachedRegionLocations) {
+        this.cachedRegionLocations.remove(Bytes.mapKey(tableName));
+      }
     }
 
     /*
@@ -1027,8 +954,10 @@ public class HConnectionManager {
             server = (HRegionInterface)HBaseRPC.waitForProxy(
                 serverInterfaceClass, HBaseRPCProtocolVersion.versionID,
                 regionServer.getInetSocketAddress(), this.conf,
-                this.maxRPCAttempts, this.rpcTimeout);
+                this.maxRPCAttempts, this.rpcTimeout, this.rpcTimeout);
           } catch (RemoteException e) {
+            LOG.warn("RemoteException connecting to RS", e);
+            // Throw what the RemoteException was carrying.
             throw RemoteExceptionHandler.decodeRemoteException(e);
           }
           this.servers.put(regionServer.toString(), server);
@@ -1043,98 +972,23 @@ public class HConnectionManager {
       return getHRegionConnection(regionServer, false);
     }
 
-    public synchronized ZooKeeperWrapper getZooKeeperWrapper()
-        throws IOException {
-      return HConnectionManager.getClientZooKeeperWatcher(conf)
-          .getZooKeeperWrapper();
-    }
-
-    /*
-     * Repeatedly try to find the root region in ZK
-     * @return HRegionLocation for root region if found
-     * @throws NoServerForRegionException - if the root region can not be
-     * located after retrying
-     * @throws IOException
+    /**
+     * Get the ZooKeeper instance for this TableServers instance.
+     *
+     * If ZK has not been initialized yet, this will connect to ZK.
+     * @returns zookeeper reference
+     * @throws ZooKeeperConnectionException if there's a problem connecting to zk
      */
-    private HRegionLocation locateRootRegion()
-    throws IOException {
-
-      // We lazily instantiate the ZooKeeper object because we don't want to
-      // make the constructor have to throw IOException or handle it itself.
-      ZooKeeperWrapper zk = getZooKeeperWrapper();
-
-      HServerAddress rootRegionAddress = null;
-      for (int tries = 0; tries < numRetries; tries++) {
-        int localTimeouts = 0;
-        // ask the master which server has the root region
-        while (rootRegionAddress == null && localTimeouts < numRetries) {
-          // Don't read root region until we're out of safe mode so we know
-          // that the meta regions have been assigned.
-          rootRegionAddress = zk.readRootRegionLocation();
-          if (rootRegionAddress == null) {
-            try {
-              if (LOG.isDebugEnabled()) {
-                LOG.debug("Sleeping " + getPauseTime(tries) +
-                  "ms, waiting for root region.");
-              }
-              Thread.sleep(getPauseTime(tries));
-            } catch (InterruptedException iex) {
-              // continue
-            }
-            localTimeouts++;
-          }
-        }
-
-        if (rootRegionAddress == null) {
-          throw new NoServerForRegionException(
-              "Timed out trying to locate root region");
-        }
-
+    public synchronized ZooKeeperWatcher getZooKeeperWatcher()
+        throws ZooKeeperConnectionException {
+      if(zooKeeper == null) {
         try {
-          // Get a connection to the region server
-          HRegionInterface server = getHRegionConnection(rootRegionAddress);
-          // if this works, then we're good, and we have an acceptable address,
-          // so we can stop doing retries and return the result.
-          server.getRegionInfo(HRegionInfo.ROOT_REGIONINFO.getRegionName());
-          if (LOG.isDebugEnabled()) {
-            LOG.debug("Found ROOT at " + rootRegionAddress);
-          }
-          break;
-        } catch (Throwable t) {
-          t = translateException(t);
-
-          if (tries == numRetries - 1) {
-            throw new NoServerForRegionException("Timed out trying to locate "+
-                "root region because: " + t.getMessage());
-          }
-
-          // Sleep and retry finding root region.
-          try {
-            if (LOG.isDebugEnabled()) {
-              LOG.debug("Root region location changed. Sleeping.");
-            }
-            Thread.sleep(getPauseTime(tries));
-            if (LOG.isDebugEnabled()) {
-              LOG.debug("Wake. Retry finding root region.");
-            }
-          } catch (InterruptedException iex) {
-            // continue
-          }
+          this.zooKeeper = new ZooKeeperWatcher(conf, "hconnection", this);
+        } catch (IOException e) {
+          throw new ZooKeeperConnectionException(e);
         }
-
-        rootRegionAddress = null;
       }
-
-      // if the address is null by this point, then the retries have failed,
-      // and we're sort of sunk
-      if (rootRegionAddress == null) {
-        throw new NoServerForRegionException(
-          "unable to locate root region server");
-      }
-
-      // return the region location
-      return new HRegionLocation(
-        HRegionInfo.ROOT_REGIONINFO, rootRegionAddress);
+      return zooKeeper;
     }
 
     public <T> T getRegionServerWithRetries(ServerCallable<T> callable)
@@ -1155,7 +1009,8 @@ public class HConnectionManager {
         try {
           Thread.sleep(getPauseTime(tries));
         } catch (InterruptedException e) {
-          // continue
+          Thread.currentThread().interrupt();
+          throw new IOException("Giving up trying to get region server: thread is interrupted.");
         }
       }
       return null;
@@ -1176,203 +1031,6 @@ public class HConnectionManager {
       }
     }
 
-    private HRegionLocation
-      getRegionLocationForRowWithRetries(byte[] tableName, byte[] rowKey,
-        boolean reload)
-    throws IOException {
-      boolean reloadFlag = reload;
-      List<Throwable> exceptions = new ArrayList<Throwable>();
-      HRegionLocation location = null;
-      int tries = 0;
-      for (; tries < numRetries;) {
-        try {
-          location = getRegionLocation(tableName, rowKey, reloadFlag);
-        } catch (Throwable t) {
-          exceptions.add(t);
-        }
-        if (location != null) {
-          break;
-        }
-        reloadFlag = true;
-        tries++;
-        try {
-          Thread.sleep(getPauseTime(tries));
-        } catch (InterruptedException e) {
-          // continue
-        }
-      }
-      if (location == null) {
-        throw new RetriesExhaustedException(" -- nothing found, no 'location' returned," +
-          " tableName=" + Bytes.toString(tableName) +
-          ", reload=" + reload + " --",
-          HConstants.EMPTY_BYTE_ARRAY, rowKey, tries, exceptions);
-      }
-      return location;
-    }
-
-    /*
-     * Helper class for batch updates.
-     * Holds code shared doing batch puts and batch deletes.
-     */
-    private abstract class Batch {
-      final HConnection c;
-
-      private Batch(final HConnection c) {
-        this.c = c;
-      }
-
-      /**
-       * This is the method subclasses must implement.
-       * @param currentList current list of rows
-       * @param tableName table we are processing
-       * @param row row
-       * @return Count of items processed or -1 if all.
-       * @throws IOException if a remote or network exception occurs
-       * @throws RuntimeException other undefined exception
-       */
-      abstract int doCall(final List<? extends Row> currentList,
-        final byte [] row, final byte [] tableName)
-      throws IOException, RuntimeException;
-
-      /**
-       * Process the passed <code>list</code>.
-       * @param list list of rows to process
-       * @param tableName table we are processing
-       * @return Count of how many added or -1 if all added.
-       * @throws IOException if a remote or network exception occurs
-       */
-      int process(final List<? extends Row> list, final byte[] tableName)
-      throws IOException {
-        byte [] region = getRegionName(tableName, list.get(0).getRow(), false);
-        byte [] currentRegion = region;
-        boolean isLastRow;
-        boolean retryOnlyOne = false;
-        List<Row> currentList = new ArrayList<Row>();
-        int i, tries;
-        for (i = 0, tries = 0; i < list.size() && tries < numRetries; i++) {
-          Row row = list.get(i);
-          currentList.add(row);
-          // If the next record goes to a new region, then we are to clear
-          // currentList now during this cycle.
-          isLastRow = (i + 1) == list.size();
-          if (!isLastRow) {
-            region = getRegionName(tableName, list.get(i + 1).getRow(), false);
-          }
-          if (!Bytes.equals(currentRegion, region) || isLastRow || retryOnlyOne) {
-            int index = doCall(currentList, row.getRow(), tableName);
-            // index is == -1 if all processed successfully, else its index
-            // of last record successfully processed.
-            if (index != -1) {
-              if (tries == numRetries - 1) {
-                throw new RetriesExhaustedException("Some server, retryOnlyOne=" +
-                  retryOnlyOne + ", index=" + index + ", islastrow=" + isLastRow +
-                  ", tries=" + tries + ", numtries=" + numRetries + ", i=" + i +
-                  ", listsize=" + list.size() + ", region=" +
-                  Bytes.toStringBinary(region), currentRegion, row.getRow(),
-                  tries, new ArrayList<Throwable>());
-              }
-              tries = doBatchPause(currentRegion, tries);
-              i = i - currentList.size() + index;
-              retryOnlyOne = true;
-              // Reload location.
-              region = getRegionName(tableName, list.get(i + 1).getRow(), true);
-            } else {
-              // Reset these flags/counters on successful batch Put
-              retryOnlyOne = false;
-              tries = 0;
-            }
-            currentRegion = region;
-            currentList.clear();
-          }
-        }
-        return i;
-      }
-
-      /*
-       * @param t
-       * @param r
-       * @param re
-       * @return Region name that holds passed row <code>r</code>
-       * @throws IOException
-       */
-      private byte [] getRegionName(final byte [] t, final byte [] r,
-        final boolean re)
-      throws IOException {
-        HRegionLocation location = getRegionLocationForRowWithRetries(t, r, re);
-        return location.getRegionInfo().getRegionName();
-      }
-
-      /*
-       * Do pause processing before retrying...
-       * @param currentRegion
-       * @param tries
-       * @return New value for tries.
-       */
-      private int doBatchPause(final byte [] currentRegion, final int tries) {
-        int localTries = tries;
-        long sleepTime = getPauseTime(tries);
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Reloading region " + Bytes.toStringBinary(currentRegion) +
-            " location because regionserver didn't accept updates; tries=" +
-            tries + " of max=" + numRetries + ", waiting=" + sleepTime + "ms");
-        }
-        try {
-          Thread.sleep(sleepTime);
-          localTries++;
-        } catch (InterruptedException e) {
-          // continue
-        }
-        return localTries;
-      }
-    }
-
-    public int processBatchOfRows(final ArrayList<Put> list,
-      final byte[] tableName)
-    throws IOException {
-      if (list.isEmpty()) return 0;
-      if (list.size() > 1) Collections.sort(list);
-      Batch b = new Batch(this) {
-        @SuppressWarnings("unchecked")
-        @Override
-        int doCall(final List<? extends Row> currentList, final byte [] row,
-          final byte [] tableName)
-        throws IOException, RuntimeException {
-          final List<Put> puts = (List<Put>)currentList;
-          return getRegionServerWithRetries(new ServerCallable<Integer>(this.c,
-              tableName, row) {
-            public Integer call() throws IOException {
-              return server.put(location.getRegionInfo().getRegionName(), puts);
-            }
-          });
-        }
-      };
-      return b.process(list, tableName);
-    }
-
-    public int processBatchOfDeletes(final List<Delete> list,
-      final byte[] tableName)
-    throws IOException {
-      if (list.isEmpty()) return 0;
-      if (list.size() > 1) Collections.sort(list);
-      Batch b = new Batch(this) {
-        @SuppressWarnings("unchecked")
-        @Override
-        int doCall(final List<? extends Row> currentList, final byte [] row,
-          final byte [] tableName)
-        throws IOException, RuntimeException {
-          final List<Delete> deletes = (List<Delete>)currentList;
-          return getRegionServerWithRetries(new ServerCallable<Integer>(this.c,
-                tableName, row) {
-              public Integer call() throws IOException {
-                return server.delete(location.getRegionInfo().getRegionName(),
-                  deletes);
-              }
-            });
-          }
-        };
-        return b.process(list, tableName);
-      }
-
     void close(boolean stopProxy) {
       if (master != null) {
         if (stopProxy) {
@@ -1386,161 +1044,26 @@ public class HConnectionManager {
           HBaseRPC.stopProxy(i);
         }
       }
+      if (this.zooKeeper != null) {
+        LOG.info("Closed zookeeper sessionid=0x" +
+          Long.toHexString(this.zooKeeper.getZooKeeper().getSessionId()));
+        this.zooKeeper.close();
+        this.zooKeeper = null;
+      }
+      this.closed = true;
     }
 
-    /**
-     * Process a batch of Puts on the given executor service.
-     *
-     * @param list the puts to make - successful puts will be removed.
-     * @param pool thread pool to execute requests on
-     *
-     * In the case of an exception, we take different actions depending on the
-     * situation:
-     *  - If the exception is a DoNotRetryException, we rethrow it and leave the
-     *    'list' parameter in an indeterminate state.
-     *  - If the 'list' parameter is a singleton, we directly throw the specific
-     *    exception for that put.
-     *  - Otherwise, we throw a generic exception indicating that an error occurred.
-     *    The 'list' parameter is mutated to contain those puts that did not succeed.
-     */
-    public void processBatchOfPuts(List<Put> list,
-                                   final byte[] tableName, ExecutorService pool) throws IOException {
-      boolean singletonList = list.size() == 1;
-      Throwable singleRowCause = null;
-      for ( int tries = 0 ; tries < numRetries && !list.isEmpty(); ++tries) {
-        Collections.sort(list);
-        Map<HServerAddress, MultiPut> regionPuts =
-            new HashMap<HServerAddress, MultiPut>();
-        // step 1:
-        //  break up into regionserver-sized chunks and build the data structs
-        for ( Put put : list ) {
-          byte [] row = put.getRow();
-
-          HRegionLocation loc = locateRegion(tableName, row, true);
-          HServerAddress address = loc.getServerAddress();
-          byte [] regionName = loc.getRegionInfo().getRegionName();
-
-          MultiPut mput = regionPuts.get(address);
-          if (mput == null) {
-            mput = new MultiPut(address);
-            regionPuts.put(address, mput);
-          }
-          mput.add(regionName, put);
-        }
-
-        // step 2:
-        //  make the requests
-        // Discard the map, just use a list now, makes error recovery easier.
-        List<MultiPut> multiPuts = new ArrayList<MultiPut>(regionPuts.values());
-
-        List<Future<MultiPutResponse>> futures =
-            new ArrayList<Future<MultiPutResponse>>(regionPuts.size());
-        for ( MultiPut put : multiPuts ) {
-          futures.add(pool.submit(createPutCallable(put.address,
-              put,
-              tableName)));
-        }
-        // RUN!
-        List<Put> failed = new ArrayList<Put>();
-
-        // step 3:
-        //  collect the failures and tries from step 1.
-        for (int i = 0; i < futures.size(); i++ ) {
-          Future<MultiPutResponse> future = futures.get(i);
-          MultiPut request = multiPuts.get(i);
-          try {
-            MultiPutResponse resp = future.get();
-
-            // For each region
-            for (Map.Entry<byte[], List<Put>> e : request.puts.entrySet()) {
-              Integer result = resp.getAnswer(e.getKey());
-              if (result == null) {
-                // failed
-                LOG.debug("Failed all for region: " +
-                    Bytes.toStringBinary(e.getKey()) + ", removing from cache");
-                failed.addAll(e.getValue());
-              } else if (result >= 0) {
-                // some failures
-                List<Put> lst = e.getValue();
-                failed.addAll(lst.subList(result, lst.size()));
-                LOG.debug("Failed past " + result + " for region: " +
-                    Bytes.toStringBinary(e.getKey()) + ", removing from cache");
-              }
-            }
-          } catch (InterruptedException e) {
-            // go into the failed list.
-            LOG.debug("Failed all from " + request.address, e);
-            failed.addAll(request.allPuts());
-          } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            // Don't print stack trace if NSRE; NSRE is 'normal' operation.
-            if (cause instanceof NotServingRegionException) {
-              String msg = cause.getMessage();
-              if (msg != null && msg.length() > 0) {
-                // msg is the exception as a String... we just want first line.
-                msg = msg.split("[\\n\\r]+\\s*at")[0];
-              }
-              LOG.debug("Failed execution of all on " + request.address +
-                " because: " + msg);
-            } else {
-              // all go into the failed list.
-              LOG.debug("Failed execution of all on " + request.address,
-                e.getCause());
-            }
-            failed.addAll(request.allPuts());
-
-            // Just give up, leaving the batch put list in an untouched/semi-committed state
-            if (e.getCause() instanceof DoNotRetryIOException) {
-              throw (DoNotRetryIOException) e.getCause();
-            }
-
-            if (singletonList) {
-              // be richer for reporting in a 1 row case.
-              singleRowCause = e.getCause();
-            }
-          }
-        }
-        list.clear();
-        if (!failed.isEmpty()) {
-          for (Put failedPut: failed) {
-            deleteCachedLocation(tableName, failedPut.getRow());
-          }
-
-          list.addAll(failed);
-
-          long sleepTime = getPauseTime(tries);
-          LOG.debug("processBatchOfPuts had some failures, sleeping for " + sleepTime +
-              " ms!");
-          try {
-            Thread.sleep(sleepTime);
-          } catch (InterruptedException ignored) {
-          }
-        }
-      }
-      if (!list.isEmpty()) {
-        if (singletonList && singleRowCause != null) {
-          throw new IOException(singleRowCause);
-        }
-
-        // ran out of retries and didnt succeed everything!
-        throw new RetriesExhaustedException("Still had " + list.size() + " puts left after retrying " +
-            numRetries + " times.");
-      }
-    }
-
-
-    private Callable<MultiPutResponse> createPutCallable(
-        final HServerAddress address, final MultiPut puts,
+    private Callable<MultiResponse> createCallable(
+        final HServerAddress address,
+        final MultiAction multi,
         final byte [] tableName) {
       final HConnection connection = this;
-      return new Callable<MultiPutResponse>() {
-        public MultiPutResponse call() throws IOException {
+      return new Callable<MultiResponse>() {
+        public MultiResponse call() throws IOException {
           return getRegionServerWithoutRetries(
-              new ServerCallable<MultiPutResponse>(connection, tableName, null) {
-                public MultiPutResponse call() throws IOException {
-                  MultiPutResponse resp = server.multiPut(puts);
-                  resp.request = puts;
-                  return resp;
+              new ServerCallable<MultiResponse>(connection, tableName, null) {
+                public MultiResponse call() throws IOException {
+                  return server.multi(multi);
                 }
                 @Override
                 public void instantiateServer(boolean reload) throws IOException {
@@ -1550,6 +1073,179 @@ public class HConnectionManager {
           );
         }
       };
+    }
+
+    public void processBatch(List<Row> list,
+        final byte[] tableName,
+        ExecutorService pool,
+        Object[] results) throws IOException, InterruptedException {
+
+      // results must be the same size as list
+      if (results.length != list.size()) {
+        throw new IllegalArgumentException("argument results must be the same size as argument list");
+      }
+
+      if (list.size() == 0) {
+        return;
+      }
+
+      // Keep track of the most recent servers for any given item for better
+      // exceptional reporting.
+      HServerAddress [] lastServers = new HServerAddress[results.length];
+      List<Row> workingList = new ArrayList<Row>(list);
+      boolean retry = true;
+      Throwable singleRowCause = null;
+
+      for (int tries = 0; tries < numRetries && retry; ++tries) {
+
+        // sleep first, if this is a retry
+        if (tries >= 1) {
+          long sleepTime = getPauseTime(tries);
+          LOG.debug("Retry " +tries+ ", sleep for " +sleepTime+ "ms!");
+          Thread.sleep(sleepTime);
+        }
+
+        // step 1: break up into regionserver-sized chunks and build the data structs
+
+        Map<HServerAddress, MultiAction> actionsByServer = new HashMap<HServerAddress, MultiAction>();
+        for (int i = 0; i < workingList.size(); i++) {
+          Row row = workingList.get(i);
+          if (row != null) {
+            HRegionLocation loc = locateRegion(tableName, row.getRow(), true);
+            HServerAddress address = loc.getServerAddress();
+            byte[] regionName = loc.getRegionInfo().getRegionName();
+
+            MultiAction actions = actionsByServer.get(address);
+            if (actions == null) {
+              actions = new MultiAction();
+              actionsByServer.put(address, actions);
+            }
+
+            Action action = new Action(regionName, row, i);
+            lastServers[i] = address;
+            actions.add(regionName, action);
+          }
+        }
+
+        // step 2: make the requests
+
+        Map<HServerAddress,Future<MultiResponse>> futures =
+            new HashMap<HServerAddress, Future<MultiResponse>>(actionsByServer.size());
+
+        for (Entry<HServerAddress, MultiAction> e : actionsByServer.entrySet()) {
+          futures.put(e.getKey(), pool.submit(createCallable(e.getKey(), e.getValue(), tableName)));
+        }
+
+        // step 3: collect the failures and successes and prepare for retry
+
+        for (Entry<HServerAddress, Future<MultiResponse>> responsePerServer : futures.entrySet()) {
+          HServerAddress address = responsePerServer.getKey();
+
+          try {
+            Future<MultiResponse> future = responsePerServer.getValue();
+            MultiResponse resp = future.get();
+
+            if (resp == null) {
+              // Entire server failed
+              LOG.debug("Failed all for server: " + address + ", removing from cache");
+              continue;
+            }
+
+            for (Entry<byte[], List<Pair<Integer,Object>>> e : resp.getResults().entrySet()) {
+              byte[] regionName = e.getKey();
+              List<Pair<Integer, Object>> regionResults = e.getValue();
+              for (Pair<Integer, Object> regionResult : regionResults) {
+                if (regionResult == null) {
+                  // if the first/only record is 'null' the entire region failed.
+                  LOG.debug("Failures for region: " +
+                      Bytes.toStringBinary(regionName) +
+                      ", removing from cache");
+                } else {
+                  // Result might be an Exception, including DNRIOE
+                  results[regionResult.getFirst()] = regionResult.getSecond();
+                }
+              }
+            }
+          } catch (ExecutionException e) {
+            LOG.debug("Failed all from " + address, e);
+          }
+        }
+
+        // step 4: identify failures and prep for a retry (if applicable).
+
+        // Find failures (i.e. null Result), and add them to the workingList (in
+        // order), so they can be retried.
+        retry = false;
+        workingList.clear();
+        for (int i = 0; i < results.length; i++) {
+          // if null (fail) or instanceof Throwable && not instanceof DNRIOE
+          // then retry that row. else dont.
+          if (results[i] == null ||
+              (results[i] instanceof Throwable &&
+                  !(results[i] instanceof DoNotRetryIOException))) {
+
+            retry = true;
+
+            Row row = list.get(i);
+            workingList.add(row);
+            deleteCachedLocation(tableName, row.getRow());
+          } else {
+            // add null to workingList, so the order remains consistent with the original list argument.
+            workingList.add(null);
+          }
+        }
+      }
+
+      if (retry) {
+        // Simple little check for 1 item failures.
+        if (singleRowCause != null) {
+          throw new IOException(singleRowCause);
+        }
+      }
+
+
+      List<Throwable> exceptions = new ArrayList<Throwable>();
+      List<Row> actions = new ArrayList<Row>();
+      List<HServerAddress> addresses = new ArrayList<HServerAddress>();
+
+      for (int i = 0 ; i < results.length; i++) {
+        if (results[i] == null || results[i] instanceof Throwable) {
+          exceptions.add((Throwable)results[i]);
+          actions.add(list.get(i));
+          addresses.add(lastServers[i]);
+        }
+      }
+
+      if (!exceptions.isEmpty()) {
+        throw new RetriesExhaustedWithDetailsException(exceptions,
+            actions,
+            addresses);
+      }
+    }
+
+    /**
+     * @deprecated Use HConnectionManager::processBatch instead.
+     */
+    public void processBatchOfPuts(List<Put> list,
+        final byte[] tableName,
+        ExecutorService pool) throws IOException {
+      Object[] results = new Object[list.size()];
+      try {
+        processBatch((List) list, tableName, pool, results);
+      } catch (InterruptedException e) {
+        throw new IOException(e);
+      } finally {
+
+        // mutate list so that it is empty for complete success, or contains only failed records
+        // results are returned in the same order as the requests in list
+        // walk the list backwards, so we can remove from list without impacting the indexes of earlier members
+        for (int i = results.length - 1; i>=0; i--) {
+          if (results[i] instanceof Result) {
+            // successful Puts are removed from the list here.
+            list.remove(i);
+          }
+        }
+      }
     }
 
     private Throwable translateException(Throwable t) throws IOException {
@@ -1614,6 +1310,28 @@ public class HConnectionManager {
         cacheLocation(tableName,
             new HRegionLocation(e.getKey(), e.getValue()));
       }
+    }
+
+    @Override
+    public void abort(final String msg, Throwable t) {
+      if (t instanceof KeeperException.SessionExpiredException) {
+        try {
+          LOG.info("This client just lost it's session with ZooKeeper, trying" +
+              " to reconnect.");
+          resetZooKeeperTrackers();
+          LOG.info("Reconnected successfully. This disconnect could have been" +
+              " caused by a network partition or a long-running GC pause," +
+              " either way it's recommended that you verify your environment.");
+          return;
+        } catch (ZooKeeperConnectionException e) {
+          LOG.error("Could not reconnect to ZooKeeper after session" +
+              " expiration, aborting");
+          t = e;
+        }
+      }
+      if (t != null) LOG.fatal(msg, t);
+      else LOG.fatal(msg);
+      this.closed = true;
     }
   }
 }

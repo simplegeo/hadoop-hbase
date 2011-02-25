@@ -19,13 +19,13 @@
  */
 package org.apache.hadoop.hbase.replication.regionserver;
 
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.HConstants;
-
-import java.io.IOException;
-import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.hadoop.hbase.Stoppable;
 
 /**
  * Interface that defines a replication source
@@ -45,7 +45,7 @@ public interface ReplicationSourceInterface {
   public void init(final Configuration conf,
                    final FileSystem fs,
                    final ReplicationSourceManager manager,
-                   final AtomicBoolean stopper,
+                   final Stoppable stopper,
                    final AtomicBoolean replicating,
                    final String peerClusterId) throws IOException;
 
@@ -68,8 +68,16 @@ public interface ReplicationSourceInterface {
 
   /**
    * End the replication
+   * @param reason why it's terminating
    */
-  public void terminate();
+  public void terminate(String reason);
+
+  /**
+   * End the replication
+   * @param reason why it's terminating
+   * @param cause the error that's causing it
+   */
+  public void terminate(String reason, Exception cause);
 
   /**
    * Get the id that the source is replicating to
@@ -77,4 +85,17 @@ public interface ReplicationSourceInterface {
    * @return peer cluster id
    */
   public String getPeerClusterZnode();
+
+  /**
+   * Get the id that the source is replicating to.
+   *
+   * @return peer cluster id
+   */
+  public String getPeerClusterId();
+
+  /**
+   * Set if this source is enabled or disabled
+   * @param status the new status
+   */
+  public void setSourceEnabled(boolean status);
 }

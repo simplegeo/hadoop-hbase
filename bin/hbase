@@ -42,7 +42,7 @@
 #
 #   MAVEN_HOME       Where mvn is installed.
 #
-bin=`dirname "$BASH_SOURCE"`
+bin=`dirname "$0"`
 bin=`cd "$bin">/dev/null; pwd`
 
 # This will set HBASE_HOME, etc.
@@ -54,9 +54,9 @@ CYGWIN*) cygwin=true;;
 esac
 
 # Detect if we are in hbase sources dir
-in_sources_dir=false
-if [ -f $HBASE_HOME/pom.xml ]; then
-  in_sources_dir=true
+in_dev_env=false
+if [ -d "${HBASE_HOME}/target" ]; then
+  in_dev_env=true
 fi
 
 # if no args specified, show usage
@@ -64,9 +64,6 @@ if [ $# = 0 ]; then
   echo "Usage: hbase <command>"
   echo "where <command> is one of:"
   echo "  shell            run the HBase shell"
-  if $in_sources_dir; then
-    echo "  shell-tests      run the HBase shell tests"
-  fi
   echo "  zkcli            run the ZooKeeper shell"
   echo "  master           run an HBase HMaster node" 
   echo "  regionserver     run an HBase HRegionServer node" 
@@ -76,6 +73,7 @@ if [ $# = 0 ]; then
   echo "  avro             run an HBase Avro server" 
   echo "  migrate          upgrade an hbase.rootdir"
   echo "  hbck             run the hbase 'fsck' tool"
+  echo "  classpath        dump hbase CLASSPATH"
   echo " or"
   echo "  CLASSNAME        run the class named CLASSNAME"
   echo "Most commands print help when invoked w/o parameters."
@@ -109,16 +107,10 @@ CLASSPATH="${HBASE_CONF_DIR}"
 CLASSPATH=${CLASSPATH}:$JAVA_HOME/lib/tools.jar
 
 add_maven_deps_to_classpath() {
-  # The maven build dir is called 'target'
-  target="${HBASE_HOME}/target"
-  if [ ! -d "${HBASE_HOME}/target" ]
-  then
-    mkdir "${target}"
-  fi
   # Need to generate classpath from maven pom. This is costly so generate it
   # and cache it. Save the file into our target dir so a mvn clean will get
   # clean it up and force us create a new one.
-  f="${target}/cached_classpath.txt"
+  f="${HBASE_HOME}/target/cached_classpath.txt"
   if [ ! -f "${f}" ]
   then
     ${MVN} -f "${HBASE_HOME}/pom.xml" dependency:build-classpath -Dmdep.outputFile="${f}" &> /dev/null
@@ -141,7 +133,7 @@ add_maven_test_classes_to_classpath() {
 }
 
 # Add maven target directory
-if $in_sources_dir; then
+if $in_dev_env; then
   add_maven_deps_to_classpath
   add_maven_main_classes_to_classpath
   add_maven_test_classes_to_classpath
@@ -175,16 +167,6 @@ if [ "$HBASE_CLASSPATH" != "" ]; then
   CLASSPATH=${CLASSPATH}:${HBASE_CLASSPATH}
 fi
 
-# And very last, add other project configuration dirs - this
-# allows someone to override the hdfs config by putting an hdfs-site
-# in hbase's conf dir, for example
-if [ -n "$ZOOKEEPER_CONF_DIR" ]; then
-  CLASSPATH=${CLASSPATH}:${ZOOKEEPER_CONF_DIR}
-fi
-if [ -n "$HADOOP_CONF_DIR" ]; then
-  CLASSPATH=${CLASSPATH}:${HADOOP_CONF_DIR}
-fi
-
 # default log directory & file
 if [ "$HBASE_LOG_DIR" = "" ]; then
   HBASE_LOG_DIR="$HBASE_HOME/logs"
@@ -199,21 +181,26 @@ if $cygwin; then
   HBASE_HOME=`cygpath -d "$HBASE_HOME"`
   HBASE_LOG_DIR=`cygpath -d "$HBASE_LOG_DIR"`
 fi
+
+function append_path() {
+  if [ -z "$1" ]; then
+    echo $2
+  else
+    echo $1:$2
+  fi
+}
+
 # setup 'java.library.path' for native-hadoop code if necessary
-JAVA_LIBRARY_PATH=''
+JAVA_LIBRARY_PATH="$HBASE_LIBRARY_PATH"
 if [ -d "${HBASE_HOME}/build/native" -o -d "${HBASE_HOME}/lib/native" ]; then
   JAVA_PLATFORM=`CLASSPATH=${CLASSPATH} ${JAVA} org.apache.hadoop.util.PlatformName | sed -e "s/ /_/g"`
 
   if [ -d "$HBASE_HOME/build/native" ]; then
-    JAVA_LIBRARY_PATH=${HBASE_HOME}/build/native/${JAVA_PLATFORM}/lib
+    JAVA_LIBRARY_PATH=$(append_path "$JAVA_LIBRARY_PATH" ${HBASE_HOME}/build/native/${JAVA_PLATFORM}/lib)
   fi
 
   if [ -d "${HBASE_HOME}/lib/native" ]; then
-    if [ "x$JAVA_LIBRARY_PATH" != "x" ]; then
-      JAVA_LIBRARY_PATH=${JAVA_LIBRARY_PATH}:${HBASE_HOME}/lib/native/${JAVA_PLATFORM}
-    else
-      JAVA_LIBRARY_PATH=${HBASE_HOME}/lib/native/${JAVA_PLATFORM}
-    fi
+    JAVA_LIBRARY_PATH=$(append_path "$JAVA_LIBRARY_PATH" ${HBASE_HOME}/lib/native/${JAVA_PLATFORM})
   fi
 fi
 
@@ -228,14 +215,6 @@ unset IFS
 # figure out which class to run
 if [ "$COMMAND" = "shell" ] ; then
   CLASS="org.jruby.Main ${HBASE_HOME}/bin/hirb.rb"
-elif $in_sources_dir && [ "$COMMAND" = "shell-tests" ] ; then
-  # Finx maven build classpath
-  add_maven_deps_to_classpath
-  add_maven_main_classes_to_classpath
-  add_maven_test_classes_to_classpath
-  # Start the tests
-  CORESRC="${HBASE_HOME}/src"
-  CLASS="org.jruby.Main -I${CORESRC}/main/ruby -I${CORESRC}/test/ruby ${CORESRC}/test/ruby/tests_runner.rb"
 elif [ "$COMMAND" = "master" ] ; then
   CLASS='org.apache.hadoop.hbase.master.HMaster'
   if [ "$1" != "stop" ] ; then
@@ -264,14 +243,16 @@ elif [ "$COMMAND" = "avro" ] ; then
 elif [ "$COMMAND" = "migrate" ] ; then
   CLASS='org.apache.hadoop.hbase.util.Migrate'
 elif [ "$COMMAND" = "hbck" ] ; then
-  CLASS='org.apache.hadoop.hbase.client.HBaseFsck'
+  CLASS='org.apache.hadoop.hbase.util.HBaseFsck'
 elif [ "$COMMAND" = "zookeeper" ] ; then
   CLASS='org.apache.hadoop.hbase.zookeeper.HQuorumPeer'
   if [ "$1" != "stop" ] ; then
     HBASE_OPTS="$HBASE_OPTS $HBASE_ZOOKEEPER_OPTS"
   fi
 elif [ "$COMMAND" = "zkcli" ] ; then
-  CLASS='org.apache.zookeeper.ZooKeeperMain'
+  # ZooKeeperMainServerArg returns '-server HOST:PORT' or empty string.
+  SERVER_ARG=`"$bin"/hbase org.apache.hadoop.hbase.zookeeper.ZooKeeperMainServerArg` 
+  CLASS="org.apache.zookeeper.ZooKeeperMain ${SERVER_ARG}"
 elif [ "$COMMAND" = "classpath" ] ; then
   echo $CLASSPATH
   exit 0

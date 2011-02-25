@@ -19,24 +19,8 @@
  */
 package org.apache.hadoop.hbase.client;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.DoNotRetryIOException;
-import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.HRegionLocation;
-import org.apache.hadoop.hbase.HServerAddress;
-import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.NotServingRegionException;
-import org.apache.hadoop.hbase.UnknownScannerException;
-import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.hbase.util.Writables;
-
+import java.io.DataInput;
+import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -52,20 +36,56 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.DoNotRetryIOException;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HRegionLocation;
+import org.apache.hadoop.hbase.HServerAddress;
+import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.NotServingRegionException;
+import org.apache.hadoop.hbase.UnknownScannerException;
+import org.apache.hadoop.hbase.ZooKeeperConnectionException;
+import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.Writables;
+import org.apache.hadoop.hbase.zookeeper.ZKUtil;
+import org.apache.zookeeper.KeeperException;
 
 /**
  * Used to communicate with a single HBase table.
- * 
- * This class is not thread safe for writes.
- * Gets, puts, and deletes take out a row lock for the duration
- * of their operation.  Scans (currently) do not respect
- * row locking.
- * 
- * See {@link HBaseAdmin} to create, drop, list, enable and disable tables.
+ *
+ * This class is not thread safe for updates; the underlying write buffer can
+ * be corrupted if multiple threads contend over a single HTable instance.
+ *
+ * <p>Instances of HTable passed the same {@link Configuration} instance will
+ * share connections to servers out on the cluster and to the zookeeper ensemble
+ * as well as caches of  region locations.  This is usually a *good* thing.
+ * This happens because they will all share the same underlying
+ * {@link HConnection} instance.  See {@link HConnectionManager} for more on
+ * how this mechanism works.
+ *
+ * <p>{@link HConnection} will read most of the
+ * configuration it needs from the passed {@link Configuration} on initial
+ * construction.  Thereafter, for settings such as
+ * <code>hbase.client.pause</code>, <code>hbase.client.retries.number</code>,
+ * and <code>hbase.client.rpc.maxattempts</code> updating their values in the
+ * passed {@link Configuration} subsequent to {@link HConnection} construction
+ * will go unnoticed.  To run with changed values, make a new
+ * {@link HTable} passing a new {@link Configuration} instance that has the
+ * new configuration.
+ *
+ * @see HBaseAdmin for create, drop, list, enable and disable of tables.
+ * @see HConnection
+ * @see HConnectionManager
  */
 public class HTable implements HTableInterface {
+  private static final Log LOG = LogFactory.getLog(HTable.class);
   private final HConnection connection;
   private final byte [] tableName;
   protected final int scannerTimeout;
@@ -76,14 +96,18 @@ public class HTable implements HTableInterface {
   private long currentWriteBufferSize;
   protected int scannerCaching;
   private int maxKeyValueSize;
-
+  private ExecutorService pool;  // For Multi
   private long maxScannerResultSize;
 
   /**
    * Creates an object to access a HBase table.
-   *
-   * @param tableName Name of the table.
+   * Internally it creates a new instance of {@link Configuration} and a new
+   * client to zookeeper as well as other resources.  It also comes up with
+   * a fresh view of the cluster and must do discovery from scratch of region
+   * locations; i.e. it will not make use of already-cached region locations if
+   * available. Use only when being quick and dirty.
    * @throws IOException if a remote or network exception occurs
+   * @see #HTable(Configuration, String)
    */
   public HTable(final String tableName)
   throws IOException {
@@ -92,9 +116,14 @@ public class HTable implements HTableInterface {
 
   /**
    * Creates an object to access a HBase table.
-   *
+   * Internally it creates a new instance of {@link Configuration} and a new
+   * client to zookeeper as well as other resources.  It also comes up with
+   * a fresh view of the cluster and must do discovery from scratch of region
+   * locations; i.e. it will not make use of already-cached region locations if
+   * available. Use only when being quick and dirty.
    * @param tableName Name of the table.
    * @throws IOException if a remote or network exception occurs
+   * @see #HTable(Configuration, String)
    */
   public HTable(final byte [] tableName)
   throws IOException {
@@ -103,7 +132,10 @@ public class HTable implements HTableInterface {
 
   /**
    * Creates an object to access a HBase table.
-   *
+   * Shares zookeeper connection and other resources with other HTable instances
+   * created with the same <code>conf</code> instance.  Uses already-populated
+   * region cache if one is available, populated by any other HTable instances
+   * sharing this <code>conf</code> instance.  Recommended.
    * @param conf Configuration object to use.
    * @param tableName Name of the table.
    * @throws IOException if a remote or network exception occurs
@@ -116,7 +148,10 @@ public class HTable implements HTableInterface {
 
   /**
    * Creates an object to access a HBase table.
-   *
+   * Shares zookeeper connection and other resources with other HTable instances
+   * created with the same <code>conf</code> instance.  Uses already-populated
+   * region cache if one is available, populated by any other HTable instances
+   * sharing this <code>conf</code> instance.  Recommended.
    * @param conf Configuration object to use.
    * @param tableName Name of the table.
    * @throws IOException if a remote or network exception occurs
@@ -144,12 +179,10 @@ public class HTable implements HTableInterface {
       HConstants.DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE);
     this.maxKeyValueSize = conf.getInt("hbase.client.keyvalue.maxsize", -1);
 
-    int nrHRS = getCurrentNrHRS();
-    if (nrHRS == 0) {
-      // No servers running -- set default of 10 threads.
-      nrHRS = 10;
+    int nrThreads = conf.getInt("hbase.htable.threads.max", getCurrentNrHRS());
+    if (nrThreads == 0) {
+      nrThreads = 1; // is there a better default?
     }
-    int nrThreads = conf.getInt("hbase.htable.threads.max", nrHRS);
 
     // Unfortunately Executors.newCachedThreadPool does not allow us to
     // set the maximum size of the pool, so we have to do it ourselves.
@@ -164,20 +197,19 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * TODO Might want to change this to public, would be nice if the number
-   * of threads would automatically change when servers were added and removed
    * @return the number of region servers that are currently running
    * @throws IOException if a remote or network exception occurs
    */
-  int getCurrentNrHRS() throws IOException {
-    return HConnectionManager
-      .getClientZooKeeperWatcher(this.configuration)
-      .getZooKeeperWrapper()
-      .getRSDirectoryCount();
+  public int getCurrentNrHRS() throws IOException {
+    try {
+      // We go to zk rather than to master to get count of regions to avoid
+      // HTable having a Master dependency.  See HBase-2828
+      return ZKUtil.getNumberOfChildren(this.connection.getZooKeeperWatcher(),
+          this.connection.getZooKeeperWatcher().rsZNode);
+    } catch (KeeperException ke) {
+      throw new IOException("Unexpected ZooKeeper exception", ke);
+    }
   }
-
-  // For multiput
-  private ExecutorService pool;
 
   /**
    * Tells whether or not a table is enabled or not.
@@ -245,6 +277,7 @@ public class HTable implements HTableInterface {
     return connection.getRegionLocation(tableName, row, false);
   }
 
+  @Override
   public byte [] getTableName() {
     return this.tableName;
   }
@@ -282,6 +315,7 @@ public class HTable implements HTableInterface {
     this.scannerCaching = scannerCaching;
   }
 
+  @Override
   public HTableDescriptor getTableDescriptor() throws IOException {
     return new UnmodifyableHTableDescriptor(
       this.connection.getHTableDescriptor(this.tableName));
@@ -323,9 +357,14 @@ public class HTable implements HTableInterface {
     final List<byte[]> endKeyList = new ArrayList<byte[]>();
     MetaScannerVisitor visitor = new MetaScannerVisitor() {
       public boolean processRow(Result rowResult) throws IOException {
-        HRegionInfo info = Writables.getHRegionInfo(
-            rowResult.getValue(HConstants.CATALOG_FAMILY,
-                HConstants.REGIONINFO_QUALIFIER));
+        byte [] bytes = rowResult.getValue(HConstants.CATALOG_FAMILY,
+          HConstants.REGIONINFO_QUALIFIER);
+        if (bytes == null) {
+          LOG.warn("Null " + HConstants.REGIONINFO_QUALIFIER + " cell in " +
+            rowResult);
+          return true;
+        }
+        HRegionInfo info = Writables.getHRegionInfo(bytes);
         if (Bytes.equals(info.getTableDesc().getName(), getTableName())) {
           if (!(info.isOffline() || info.isSplit())) {
             startKeyList.add(info.getStartKey());
@@ -469,6 +508,7 @@ public class HTable implements HTableInterface {
     return allRegions;
   }
 
+   @Override
    public Result getRowOrBefore(final byte[] row, final byte[] family)
    throws IOException {
      return connection.getRegionServerWithRetries(
@@ -480,18 +520,21 @@ public class HTable implements HTableInterface {
      });
    }
 
+  @Override
   public ResultScanner getScanner(final Scan scan) throws IOException {
     ClientScanner s = new ClientScanner(scan);
     s.initialize();
     return s;
   }
 
+  @Override
   public ResultScanner getScanner(byte [] family) throws IOException {
     Scan scan = new Scan();
     scan.addFamily(family);
     return getScanner(scan);
   }
 
+  @Override
   public ResultScanner getScanner(byte [] family, byte [] qualifier)
   throws IOException {
     Scan scan = new Scan();
@@ -509,6 +552,66 @@ public class HTable implements HTableInterface {
     );
   }
 
+   public Result[] get(List<Get> gets) throws IOException {
+     try {
+       Object [] r1 = batch((List)gets);
+
+       // translate.
+       Result [] results = new Result[r1.length];
+       int i=0;
+       for (Object o : r1) {
+         // batch ensures if there is a failure we get an exception instead
+         results[i++] = (Result) o;
+       }
+
+       return results;
+     } catch (InterruptedException e) {
+       throw new IOException(e);
+     }
+   }
+
+  /**
+   * Method that does a batch call on Deletes, Gets and Puts.  The ordering of
+   * execution of the actions is not defined. Meaning if you do a Put and a
+   * Get in the same {@link #batch} call, you will not necessarily be
+   * guaranteed that the Get returns what the Put had put.
+   *
+   * @param actions list of Get, Put, Delete objects
+   * @param results Empty Result[], same size as actions. Provides access to
+   * partial results, in case an exception is thrown. If there are any failures,
+   * there will be a null or Throwable will be in the results array, AND an
+   * exception will be thrown.
+   * @throws IOException
+   */
+  @Override
+  public synchronized void batch(final List<Row> actions, final Object[] results)
+      throws InterruptedException, IOException {
+    connection.processBatch(actions, tableName, pool, results);
+  }
+
+  /**
+   * Method that does a batch call on Deletes, Gets and Puts.
+   *
+   * @param actions list of Get, Put, Delete objects
+   * @return the results from the actions. A null in the return array means that
+   * the call for that action failed, even after retries
+   * @throws IOException
+   */
+  @Override
+  public synchronized Object[] batch(final List<Row> actions) throws InterruptedException, IOException {
+    Object[] results = new Object[actions.size()];
+    connection.processBatch(actions, tableName, pool, results);
+    return results;
+  }
+
+  /**
+   * Deletes the specified cells/row.
+   *
+   * @param delete The object that specifies what to delete.
+   * @throws IOException if a remote or network exception occurs.
+   * @since 0.20.0
+   */
+  @Override
   public void delete(final Delete delete)
   throws IOException {
     connection.getRegionServerWithRetries(
@@ -521,20 +624,43 @@ public class HTable implements HTableInterface {
     );
   }
 
+  /**
+   * Deletes the specified cells/rows in bulk.
+   * @param deletes List of things to delete. As a side effect, it will be modified:
+   * successful {@link Delete}s are removed. The ordering of the list will not change.
+   * @throws IOException if a remote or network exception occurs. In that case
+   * the {@code deletes} argument will contain the {@link Delete} instances
+   * that have not be successfully applied.
+   * @since 0.20.1
+   * @see #batch(java.util.List, Object[])
+   */
+  @Override
   public void delete(final List<Delete> deletes)
   throws IOException {
-    int last = 0;
+    Object[] results = new Object[deletes.size()];
     try {
-      last = connection.processBatchOfDeletes(deletes, this.tableName);
+      connection.processBatch((List) deletes, tableName, pool, results);
+    } catch (InterruptedException e) {
+      throw new IOException(e);
     } finally {
-      deletes.subList(0, last).clear();
+      // mutate list so that it is empty for complete success, or contains only failed records
+      // results are returned in the same order as the requests in list
+      // walk the list backwards, so we can remove from list without impacting the indexes of earlier members
+      for (int i = results.length - 1; i>=0; i--) {
+        // if result is not null, it succeeded
+        if (results[i] instanceof Result) {
+          deletes.remove(i);
+        }
+      }
     }
   }
 
+  @Override
   public void put(final Put put) throws IOException {
     doPut(Arrays.asList(put));
   }
 
+  @Override
   public void put(final List<Put> puts) throws IOException {
     doPut(puts);
   }
@@ -550,13 +676,30 @@ public class HTable implements HTableInterface {
     }
   }
 
+  @Override
+  public Result increment(final Increment increment) throws IOException {
+    if (!increment.hasFamilies()) {
+      throw new IOException(
+          "Invalid arguments to increment, no columns specified");
+    }
+    return connection.getRegionServerWithRetries(
+        new ServerCallable<Result>(connection, tableName, increment.getRow()) {
+          public Result call() throws IOException {
+            return server.increment(
+                location.getRegionInfo().getRegionName(), increment);
+          }
+        }
+    );
+  }
+
+  @Override
   public long incrementColumnValue(final byte [] row, final byte [] family,
       final byte [] qualifier, final long amount)
   throws IOException {
     return incrementColumnValue(row, family, qualifier, amount, true);
   }
 
-  @SuppressWarnings({"ThrowableInstanceNeverThrown"})
+  @Override
   public long incrementColumnValue(final byte [] row, final byte [] family,
       final byte [] qualifier, final long amount, final boolean writeToWAL)
   throws IOException {
@@ -594,6 +737,7 @@ public class HTable implements HTableInterface {
    * @throws IOException
    * @return true if the new put was execute, false otherwise
    */
+  @Override
   public boolean checkAndPut(final byte [] row,
       final byte [] family, final byte [] qualifier, final byte [] value,
       final Put put)
@@ -621,6 +765,7 @@ public class HTable implements HTableInterface {
    * @throws IOException
    * @return true if the new delete was executed, false otherwise
    */
+  @Override
   public boolean checkAndDelete(final byte [] row,
       final byte [] family, final byte [] qualifier, final byte [] value,
       final Delete delete)
@@ -630,7 +775,7 @@ public class HTable implements HTableInterface {
           public Boolean call() throws IOException {
             return server.checkAndDelete(
                 location.getRegionInfo().getRegionName(),
-                row, family, qualifier, value, delete) 
+                row, family, qualifier, value, delete)
             ? Boolean.TRUE : Boolean.FALSE;
           }
         }
@@ -648,6 +793,7 @@ public class HTable implements HTableInterface {
    * @return true if the specified Get matches one or more keys, false if not
    * @throws IOException
    */
+  @Override
   public boolean exists(final Get get) throws IOException {
     return connection.getRegionServerWithRetries(
         new ServerCallable<Boolean>(connection, tableName, get.getRow()) {
@@ -659,10 +805,18 @@ public class HTable implements HTableInterface {
     );
   }
 
+  /**
+   * Executes all the buffered {@link Put} operations.
+   * <p>
+   * This method gets called once automatically for every {@link Put} or batch
+   * of {@link Put}s (when {@link #batch(List)} is used) when
+   * {@link #isAutoFlush()} is {@code true}.
+   * @throws IOException if a remote or network exception occurs.
+   */
+  @Override
   public void flushCommits() throws IOException {
     try {
-      connection.processBatchOfPuts(writeBuffer,
-          tableName, pool);
+      connection.processBatchOfPuts(writeBuffer, tableName, pool);
     } finally {
       // the write buffer was adjusted by processBatchOfPuts
       currentWriteBufferSize = 0;
@@ -672,7 +826,8 @@ public class HTable implements HTableInterface {
     }
   }
 
-  public void close() throws IOException{
+  @Override
+  public void close() throws IOException {
     flushCommits();
   }
 
@@ -692,6 +847,7 @@ public class HTable implements HTableInterface {
     }
   }
 
+  @Override
   public RowLock lockRow(final byte [] row)
   throws IOException {
     return connection.getRegionServerWithRetries(
@@ -705,6 +861,7 @@ public class HTable implements HTableInterface {
     );
   }
 
+  @Override
   public void unlockRow(final RowLock rl)
   throws IOException {
     connection.getRegionServerWithRetries(
@@ -718,6 +875,7 @@ public class HTable implements HTableInterface {
     );
   }
 
+  @Override
   public boolean isAutoFlush() {
     return autoFlush;
   }
@@ -1101,10 +1259,12 @@ public class HTable implements HTableInterface {
             Thread t = new Thread(group, r,
                                   namePrefix + threadNumber.getAndIncrement(),
                                   0);
-            if (!t.isDaemon())
-                t.setDaemon(true);
-            if (t.getPriority() != Thread.NORM_PRIORITY)
-                t.setPriority(Thread.NORM_PRIORITY);
+            if (!t.isDaemon()) {
+              t.setDaemon(true);
+            }
+            if (t.getPriority() != Thread.NORM_PRIORITY) {
+              t.setPriority(Thread.NORM_PRIORITY);
+            }
             return t;
         }
   }
@@ -1116,9 +1276,10 @@ public class HTable implements HTableInterface {
    * @param tableName name of table to configure.
    * @param enable Set to true to enable region cache prefetch. Or set to
    * false to disable it.
+   * @throws ZooKeeperConnectionException
    */
   public static void setRegionCachePrefetch(final byte[] tableName,
-      boolean enable) {
+      boolean enable) throws ZooKeeperConnectionException {
     HConnectionManager.getConnection(HBaseConfiguration.create()).
     setRegionCachePrefetch(tableName, enable);
   }
@@ -1131,9 +1292,10 @@ public class HTable implements HTableInterface {
    * @param tableName name of table to configure.
    * @param enable Set to true to enable region cache prefetch. Or set to
    * false to disable it.
+   * @throws ZooKeeperConnectionException
    */
   public static void setRegionCachePrefetch(final Configuration conf,
-      final byte[] tableName, boolean enable) {
+      final byte[] tableName, boolean enable) throws ZooKeeperConnectionException {
     HConnectionManager.getConnection(conf).setRegionCachePrefetch(
         tableName, enable);
   }
@@ -1144,9 +1306,10 @@ public class HTable implements HTableInterface {
    * @param tableName name of table to check
    * @return true if table's region cache prefecth is enabled. Otherwise
    * it is disabled.
+   * @throws ZooKeeperConnectionException
    */
   public static boolean getRegionCachePrefetch(final Configuration conf,
-      final byte[] tableName) {
+      final byte[] tableName) throws ZooKeeperConnectionException {
     return HConnectionManager.getConnection(conf).getRegionCachePrefetch(
         tableName);
   }
@@ -1156,8 +1319,9 @@ public class HTable implements HTableInterface {
    * @param tableName name of table to check
    * @return true if table's region cache prefecth is enabled. Otherwise
    * it is disabled.
+   * @throws ZooKeeperConnectionException
    */
-  public static boolean getRegionCachePrefetch(final byte[] tableName) {
+  public static boolean getRegionCachePrefetch(final byte[] tableName) throws ZooKeeperConnectionException {
     return HConnectionManager.getConnection(HBaseConfiguration.create()).
     getRegionCachePrefetch(tableName);
   }

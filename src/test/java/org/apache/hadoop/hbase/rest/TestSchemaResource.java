@@ -27,6 +27,8 @@ import java.io.StringWriter;
 import javax.xml.bind.JAXBContext;
 import javax.xml.bind.JAXBException;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.rest.client.Client;
 import org.apache.hadoop.hbase.rest.client.Cluster;
@@ -36,59 +38,77 @@ import org.apache.hadoop.hbase.rest.model.TableSchemaModel;
 import org.apache.hadoop.hbase.rest.model.TestTableSchemaModel;
 import org.apache.hadoop.hbase.util.Bytes;
 
-public class TestSchemaResource extends HBaseRESTClusterTestBase {
-  static String TABLE1 = "TestSchemaResource1";
-  static String TABLE2 = "TestSchemaResource2";
+import static org.junit.Assert.*;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
-  Client client;
-  JAXBContext context;
-  HBaseAdmin admin;
+public class TestSchemaResource {
+  private static String TABLE1 = "TestSchemaResource1";
+  private static String TABLE2 = "TestSchemaResource2";
 
-  @Override
-  protected void setUp() throws Exception {
-    super.setUp();
+  private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+  private static final HBaseRESTTestingUtility REST_TEST_UTIL =
+    new HBaseRESTTestingUtility();
+  private static Client client;
+  private static JAXBContext context;
+  private static Configuration conf;
+
+  @BeforeClass
+  public static void setUpBeforeClass() throws Exception {
+    conf = TEST_UTIL.getConfiguration();
+    TEST_UTIL.startMiniCluster(3);
+    REST_TEST_UTIL.startServletContainer(conf);
+    client = new Client(new Cluster().add("localhost",
+      REST_TEST_UTIL.getServletPort()));
     context = JAXBContext.newInstance(
-        ColumnSchemaModel.class,
-        TableSchemaModel.class);
-    admin = new HBaseAdmin(conf);
-    client = new Client(new Cluster().add("localhost", testServletPort));
+      ColumnSchemaModel.class,
+      TableSchemaModel.class);
   }
 
-  @Override
-  protected void tearDown() throws Exception {
-    client.shutdown();
-    super.tearDown();
+  @AfterClass
+  public static void tearDownAfterClass() throws Exception {
+    REST_TEST_UTIL.shutdownServletContainer();
+    TEST_UTIL.shutdownMiniCluster();
   }
 
-  byte[] toXML(TableSchemaModel model) throws JAXBException {
+  private static byte[] toXML(TableSchemaModel model) throws JAXBException {
     StringWriter writer = new StringWriter();
     context.createMarshaller().marshal(model, writer);
     return Bytes.toBytes(writer.toString());
   }
 
-  TableSchemaModel fromXML(byte[] content) throws JAXBException {
+  private static TableSchemaModel fromXML(byte[] content)
+      throws JAXBException {
     return (TableSchemaModel) context.createUnmarshaller()
       .unmarshal(new ByteArrayInputStream(content));
   }
 
-  void doTestTableCreateAndDeleteXML() throws IOException, JAXBException {
+  @Test
+  public void testTableCreateAndDeleteXML() throws IOException, JAXBException {
     String schemaPath = "/" + TABLE1 + "/schema";
     TableSchemaModel model;
     Response response;
 
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     assertFalse(admin.tableExists(TABLE1));
 
     // create the table
     model = TestTableSchemaModel.buildTestModel(TABLE1);
     TestTableSchemaModel.checkModel(model, TABLE1);
-    response = client.put(schemaPath, MIMETYPE_XML, toXML(model));
+    response = client.put(schemaPath, Constants.MIMETYPE_XML, toXML(model));
     assertEquals(response.getCode(), 201);
+
+    // recall the same put operation but in read-only mode
+    conf.set("hbase.rest.readonly", "true");
+    response = client.put(schemaPath, Constants.MIMETYPE_XML, toXML(model));
+    assertEquals(response.getCode(), 403);
 
     // make sure HBase concurs, and wait for the table to come online
     admin.enableTable(TABLE1);
 
     // retrieve the schema and validate it
-    response = client.get(schemaPath, MIMETYPE_XML);
+    response = client.get(schemaPath, Constants.MIMETYPE_XML);
     assertEquals(response.getCode(), 200);
     model = fromXML(response.getBody());
     TestTableSchemaModel.checkModel(model, TABLE1);
@@ -98,13 +118,18 @@ public class TestSchemaResource extends HBaseRESTClusterTestBase {
 
     // make sure HBase concurs
     assertFalse(admin.tableExists(TABLE1));
+
+    // return read-only setting back to default
+    conf.set("hbase.rest.readonly", "false");
   }
 
-  void doTestTableCreateAndDeletePB() throws IOException, JAXBException {
+  @Test
+  public void testTableCreateAndDeletePB() throws IOException, JAXBException {
     String schemaPath = "/" + TABLE2 + "/schema";
     TableSchemaModel model;
     Response response;
 
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     assertFalse(admin.tableExists(TABLE2));
 
     // create the table
@@ -113,6 +138,12 @@ public class TestSchemaResource extends HBaseRESTClusterTestBase {
     response = client.put(schemaPath, Constants.MIMETYPE_PROTOBUF,
       model.createProtobufOutput());
     assertEquals(response.getCode(), 201);
+
+    // recall the same put operation but in read-only mode
+    conf.set("hbase.rest.readonly", "true");
+    response = client.put(schemaPath, Constants.MIMETYPE_PROTOBUF,
+      model.createProtobufOutput());
+    assertEquals(response.getCode(), 403);
 
     // make sure HBase concurs, and wait for the table to come online
     admin.enableTable(TABLE2);
@@ -129,10 +160,8 @@ public class TestSchemaResource extends HBaseRESTClusterTestBase {
 
     // make sure HBase concurs
     assertFalse(admin.tableExists(TABLE2));
-  }
 
-  public void testSchemaResource() throws Exception {
-    doTestTableCreateAndDeleteXML();
-    doTestTableCreateAndDeletePB();
+    // return read-only setting back to default
+    conf.set("hbase.rest.readonly", "false");
   }
 }

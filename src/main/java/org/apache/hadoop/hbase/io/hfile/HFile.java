@@ -23,6 +23,7 @@ import java.io.BufferedInputStream;
 import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -52,9 +53,14 @@ import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.io.HbaseMapWritable;
 import org.apache.hadoop.hbase.io.HeapSize;
+import org.apache.hadoop.hbase.regionserver.TimeRangeTracker;
+import org.apache.hadoop.hbase.util.BloomFilter;
+import org.apache.hadoop.hbase.util.ByteBloomFilter;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ClassSize;
+import org.apache.hadoop.hbase.util.CompressionTest;
 import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hbase.util.Writables;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.RawComparator;
 import org.apache.hadoop.io.Writable;
@@ -212,7 +218,7 @@ public class HFile {
     private long valuelength = 0;
 
     // Used to ensure we write in order.
-    private final RawComparator<byte []> rawComparator;
+    private final RawComparator<byte []> comparator;
 
     // A stream made per block written.
     private DataOutputStream out;
@@ -332,7 +338,7 @@ public class HFile {
       this.outputStream = ostream;
       this.closeOutputStream = false;
       this.blocksize = blocksize;
-      this.rawComparator = c == null? Bytes.BYTES_RAWCOMPARATOR: c;
+      this.comparator = c == null? Bytes.BYTES_RAWCOMPARATOR: c;
       this.name = this.outputStream.toString();
       this.compressAlgo = compress == null?
         DEFAULT_COMPRESSION_ALGORITHM: compress;
@@ -434,8 +440,8 @@ public class HFile {
       for (i = 0; i < metaNames.size(); ++i) {
         // stop when the current key is greater than our own
         byte[] cur = metaNames.get(i);
-        if (this.rawComparator.compare(cur, 0, cur.length, key, 0, key.length)
-            > 0) {
+        if (Bytes.BYTES_RAWCOMPARATOR.compare(cur, 0, cur.length, 
+            key, 0, key.length) > 0) {
           break;
         }
       }
@@ -565,7 +571,7 @@ public class HFile {
           MAXIMUM_KEY_LENGTH);
       }
       if (this.lastKeyBuffer != null) {
-        int keyComp = this.rawComparator.compare(this.lastKeyBuffer, this.lastKeyOffset,
+        int keyComp = this.comparator.compare(this.lastKeyBuffer, this.lastKeyOffset,
             this.lastKeyLength, key, offset, length);
         if (keyComp > 0) {
           throw new IOException("Added a key not lexically larger than" +
@@ -676,7 +682,7 @@ public class HFile {
       appendFileInfo(this.fileinfo, FileInfo.AVG_VALUE_LEN,
         Bytes.toBytes(avgValueLen), false);
       appendFileInfo(this.fileinfo, FileInfo.COMPARATOR,
-        Bytes.toBytes(this.rawComparator.getClass().getName()), false);
+        Bytes.toBytes(this.comparator.getClass().getName()), false);
       long pos = o.getPos();
       this.fileinfo.write(o);
       return pos;
@@ -794,6 +800,14 @@ public class HFile {
       return this.inMemory;
     }
 
+    private byte[] readAllIndex(final FSDataInputStream in, final long indexOffset,
+        final int indexSize) throws IOException {
+      byte[] allIndex = new byte[indexSize];
+      in.seek(indexOffset);
+      IOUtils.readFully(in, allIndex, 0, allIndex.length);
+      return allIndex;
+    }
+
     /**
      * Read in the index and file info.
      * @return A map of fileinfo data.
@@ -814,16 +828,27 @@ public class HFile {
       String clazzName = Bytes.toString(fi.get(FileInfo.COMPARATOR));
       this.comparator = getComparator(clazzName);
 
+      int allIndexSize = (int)(this.fileSize - this.trailer.dataIndexOffset - FixedFileTrailer.trailerSize());
+      byte[] dataAndMetaIndex = readAllIndex(this.istream, this.trailer.dataIndexOffset, allIndexSize);
+
+      ByteArrayInputStream bis = new ByteArrayInputStream(dataAndMetaIndex);
+      DataInputStream dis = new DataInputStream(bis);
+
       // Read in the data index.
-      this.blockIndex = BlockIndex.readIndex(this.comparator, this.istream,
-        this.trailer.dataIndexOffset, this.trailer.dataIndexCount);
+      this.blockIndex =
+          BlockIndex.readIndex(this.comparator, dis, this.trailer.dataIndexCount);
 
       // Read in the metadata index.
       if (trailer.metaIndexCount > 0) {
-        this.metaIndex = BlockIndex.readIndex(Bytes.BYTES_RAWCOMPARATOR,
-          this.istream, this.trailer.metaIndexOffset, trailer.metaIndexCount);
+        this.metaIndex = BlockIndex.readIndex(Bytes.BYTES_RAWCOMPARATOR, dis,
+            this.trailer.metaIndexCount);
       }
       this.fileInfoLoaded = true;
+
+      if (null != dis) {
+        dis.close();
+      }
+
       return fi;
     }
 
@@ -861,6 +886,9 @@ public class HFile {
       // Set up the codec.
       this.compressAlgo =
         Compression.Algorithm.values()[fft.compressionCodec];
+
+      CompressionTest.testCompression(this.compressAlgo);
+
       return fft;
     }
 
@@ -922,7 +950,8 @@ public class HFile {
         metaLoads++;
         // Check cache for block.  If found return.
         if (cache != null) {
-          ByteBuffer cachedBuf = cache.getBlock(name + "meta" + block);
+          ByteBuffer cachedBuf = cache.getBlock(name + "meta" + block,
+              cacheBlock);
           if (cachedBuf != null) {
             // Return a distinct 'shallow copy' of the block,
             // so pos doesnt get messed by the scanner
@@ -981,7 +1010,7 @@ public class HFile {
         blockLoads++;
         // Check cache for block.  If found return.
         if (cache != null) {
-          ByteBuffer cachedBuf = cache.getBlock(name + block);
+          ByteBuffer cachedBuf = cache.getBlock(name + block, cacheBlock);
           if (cachedBuf != null) {
             // Return a distinct 'shallow copy' of the block,
             // so pos doesnt get messed by the scanner
@@ -1057,10 +1086,10 @@ public class HFile {
         // Could maybe do with less. Study and figure it: TODO
         InputStream is = this.compressAlgo.createDecompressionStream(
             new BufferedInputStream(
-          new BoundedRangeFileInputStream(this.istream, offset, compressedSize,
-            pread),
+                new BoundedRangeFileInputStream(this.istream, offset, compressedSize,
+                                                pread),
                 Math.min(DEFAULT_BLOCKSIZE, compressedSize)),
-          decompressor, 0);
+            decompressor, 0);
         buf = ByteBuffer.allocate(decompressedSize);
         IOUtils.readFully(is, buf.array(), 0, buf.capacity());
         is.close();
@@ -1651,12 +1680,13 @@ public class HFile {
     /*
      * Read in the index that is at <code>indexOffset</code>
      * Must match what was written by writeIndex in the Writer.close.
+     * @param c Comparator to use.
      * @param in
-     * @param indexOffset
+     * @param indexSize
      * @throws IOException
      */
     static BlockIndex readIndex(final RawComparator<byte []> c,
-        final FSDataInputStream in, final long indexOffset, final int indexSize)
+        DataInputStream in, final int indexSize)
     throws IOException {
       BlockIndex bi = new BlockIndex(c);
       bi.blockOffsets = new long[indexSize];
@@ -1664,9 +1694,8 @@ public class HFile {
       bi.blockDataSizes = new int[indexSize];
       // If index size is zero, no index was written.
       if (indexSize > 0) {
-        in.seek(indexOffset);
         byte [] magic = new byte[INDEXBLOCKMAGIC.length];
-        IOUtils.readFully(in, magic, 0, magic.length);
+        in.readFully(magic);
         if (!Arrays.equals(magic, INDEXBLOCKMAGIC)) {
           throw new IOException("Index block magic is wrong: " +
             Arrays.toString(magic));
@@ -1834,6 +1863,8 @@ public class HFile {
       Configuration conf = HBaseConfiguration.create();
       conf.set("fs.defaultFS",
         conf.get(org.apache.hadoop.hbase.HConstants.HBASE_DIR));
+      conf.set("fs.default.name",
+        conf.get(org.apache.hadoop.hbase.HConstants.HBASE_DIR));
       FileSystem fs = FileSystem.get(conf);
       ArrayList<Path> files = new ArrayList<Path>();
       if (cmd.hasOption("f")) {
@@ -1869,45 +1900,47 @@ public class HFile {
         // create reader and load file info
         HFile.Reader reader = new HFile.Reader(fs, file, null, false);
         Map<byte[],byte[]> fileInfo = reader.loadFileInfo();
-        // scan over file and read key/value's and check if requested
-        HFileScanner scanner = reader.getScanner(false, false);
-        scanner.seekTo();
-        KeyValue pkv = null;
         int count = 0;
-        do {
-          KeyValue kv = scanner.getKeyValue();
-          // dump key value
-          if (printKeyValue) {
-            System.out.println("K: " + kv +
-              " V: " + Bytes.toStringBinary(kv.getValue()));
-          }
-          // check if rows are in order
-          if (checkRow && pkv != null) {
-            if (Bytes.compareTo(pkv.getRow(), kv.getRow()) > 0) {
-              System.err.println("WARNING, previous row is greater then" +
-                " current row\n\tfilename -> " + file +
-                "\n\tprevious -> " + Bytes.toStringBinary(pkv.getKey()) +
-                "\n\tcurrent  -> " + Bytes.toStringBinary(kv.getKey()));
+        if (verbose || printKeyValue || checkRow || checkFamily) {
+          // scan over file and read key/value's and check if requested
+          HFileScanner scanner = reader.getScanner(false, false);
+          scanner.seekTo();
+          KeyValue pkv = null;
+          do {
+            KeyValue kv = scanner.getKeyValue();
+            // dump key value
+            if (printKeyValue) {
+              System.out.println("K: " + kv +
+                  " V: " + Bytes.toStringBinary(kv.getValue()));
             }
-          }
-          // check if families are consistent
-          if (checkFamily) {
-            String fam = Bytes.toString(kv.getFamily());
-            if (!file.toString().contains(fam)) {
-              System.err.println("WARNING, filename does not match kv family," +
-                "\n\tfilename -> " + file +
-                "\n\tkeyvalue -> " + Bytes.toStringBinary(kv.getKey()));
+            // check if rows are in order
+            if (checkRow && pkv != null) {
+              if (Bytes.compareTo(pkv.getRow(), kv.getRow()) > 0) {
+                System.err.println("WARNING, previous row is greater then" +
+                    " current row\n\tfilename -> " + file +
+                    "\n\tprevious -> " + Bytes.toStringBinary(pkv.getKey()) +
+                    "\n\tcurrent  -> " + Bytes.toStringBinary(kv.getKey()));
+              }
             }
-            if (pkv != null && Bytes.compareTo(pkv.getFamily(), kv.getFamily()) != 0) {
-              System.err.println("WARNING, previous kv has different family" +
-                " compared to current key\n\tfilename -> " + file +
-                "\n\tprevious -> " +  Bytes.toStringBinary(pkv.getKey()) +
-                "\n\tcurrent  -> " + Bytes.toStringBinary(kv.getKey()));
+            // check if families are consistent
+            if (checkFamily) {
+              String fam = Bytes.toString(kv.getFamily());
+              if (!file.toString().contains(fam)) {
+                System.err.println("WARNING, filename does not match kv family," +
+                    "\n\tfilename -> " + file +
+                    "\n\tkeyvalue -> " + Bytes.toStringBinary(kv.getKey()));
+              }
+              if (pkv != null && Bytes.compareTo(pkv.getFamily(), kv.getFamily()) != 0) {
+                System.err.println("WARNING, previous kv has different family" +
+                    " compared to current key\n\tfilename -> " + file +
+                    "\n\tprevious -> " +  Bytes.toStringBinary(pkv.getKey()) +
+                    "\n\tcurrent  -> " + Bytes.toStringBinary(kv.getKey()));
+              }
             }
-          }
-          pkv = kv;
-          count++;
-        } while (scanner.next());
+            pkv = kv;
+            count++;
+          } while (scanner.next());
+        }
         if (verbose || printKeyValue) {
           System.out.println("Scanned kv count -> " + count);
         }
@@ -1922,9 +1955,31 @@ public class HFile {
             if (Bytes.compareTo(e.getKey(), Bytes.toBytes("MAX_SEQ_ID_KEY"))==0) {
               long seqid = Bytes.toLong(e.getValue());
               System.out.println(seqid);
+            } else if (Bytes.compareTo(e.getKey(),
+                Bytes.toBytes("TIMERANGE")) == 0) {
+              TimeRangeTracker timeRangeTracker = new TimeRangeTracker();
+              Writables.copyWritable(e.getValue(), timeRangeTracker);
+              System.out.println(timeRangeTracker.getMinimumTimestamp() +
+                  "...." + timeRangeTracker.getMaximumTimestamp());
+            } else if (Bytes.compareTo(e.getKey(), FileInfo.AVG_KEY_LEN) == 0 ||
+                Bytes.compareTo(e.getKey(), FileInfo.AVG_VALUE_LEN) == 0) {
+              System.out.println(Bytes.toInt(e.getValue()));
             } else {
               System.out.println(Bytes.toStringBinary(e.getValue()));
             }
+          }
+
+          //Printing bloom information
+          ByteBuffer b = reader.getMetaBlock("BLOOM_FILTER_META", false);
+          if (b!= null) {
+            BloomFilter bloomFilter = new ByteBloomFilter(b);
+            System.out.println("BloomSize: " + bloomFilter.getByteSize());
+            System.out.println("No of Keys in bloom: " +
+                bloomFilter.getKeyCount());
+            System.out.println("Max Keys for bloom: " +
+                bloomFilter.getMaxKeys());
+          } else {
+            System.out.println("Could not get bloom data from meta block");
           }
         }
         reader.close();

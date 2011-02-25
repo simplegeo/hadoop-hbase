@@ -1,208 +1,61 @@
-hadoop-hbase (0.89.20100924+30-1sg2) UNRELEASED; urgency=low
+hadoop-hbase (0.90.1+9-1sg0) cloudera; urgency=low
 
-  [ Jeremy Grosser ]
-  * Add debian/source/format
-
-  [ SimpleGeo Nerds ]
-
- -- SimpleGeo Nerds <nerds@simplegeo.com>  Fri, 28 Jan 2011 19:28:18 +0000
-
-hadoop-hbase (0.89.20100924+30-1sg0) foss-development; urgency=low
-
-  Commit 141178fbd79e618aff9dc8c328872d929a97bb01:
-    CLOUDERA-BUILD. Add man page.
+  Commit fab7fb4175ce4095a8e14b08918d72c72d4cf2df:
+    CLOUDERA-BUILD. Preparing for cdh3u0 development.
     
- -- Eli Collins <eli@cloudera.com>  Tue, 26 Oct 2010 00:59:28 -0700
+ -- Jenkins <dev-kitchen@cloudera.com>  Sat, 19 Feb 2011 00:28:08 -0800
 
-hadoop-hbase (0.89.20100924+29-1) cloudera; urgency=low
 
-  Commit 5e9777a0c3ce2f2c7a5bb172a4967a655b91d91e:
-    CLOUDERA-BUILD. Publish to Cloudera maven repo. Use Cloudera ZK.
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
+
+  Commit 0140046cd7dd29d72ae372c047f974b48c8b4e32:
+    CLOUDERA-BUILD. Preparing for CDH3B4 release.
     
- -- Eli Collins <eli@cloudera.com>  Mon, 11 Oct 2010 10:27:50 -0700
+ -- Jenkins <dev-kitchen@cloudera.com>  Sat, 19 Feb 2011 00:27:52 -0800
 
 
-hadoop-hbase (0.89.20100924+28-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit 80fd13dbb5d66bdfc80e6c22f6b4567f62499c49:
-    CLOUDERA-BUILD. Fix versionless jar naming symlinks for multijar case
-    
-    Ref: CDH-2203
-    
- -- Todd Lipcon <todd@cloudera.com>  Sat, 09 Oct 2010 18:45:21 -0700
-
-
-hadoop-hbase (0.89.20100924+27-1) cloudera; urgency=low
-
-  Commit baa476fc14c80e18e91ccd683c6aa045a6689fd3:
-    HBASE-3101. bin assembly should include tests and sources jar
-    
-    Author: Todd Lipcon
-    Reason: sqoop build depends on -tests jar
-    Ref: CDH-2203
-    
- -- Todd Lipcon <todd@cloudera.com>  Sat, 09 Oct 2010 17:36:53 -0700
-
-
-hadoop-hbase (0.89.20100924+26-1) cloudera; urgency=low
-
-  Commit 1faa3e29bfc2935a71197fe28cec4dbecf2b7692:
-    CLOUDERA-BUILD. Update hadoop version.
-    
- -- Eli Collins <eli@cloudera.com>  Fri, 08 Oct 2010 20:18:14 -0700
-
-
-hadoop-hbase (0.89.20100924+25-1) cloudera; urgency=low
-
-  Commit df24f2aa192153241a12711a95e861806db315f3:
-    HBASE-3096. TestCompaction timing out
+  Commit 86670a907d2957dfd0b4b0d96e47e5b26026ae76:
+    HBASE-3533. Allow HBASE_LIBRARY_PATH to point to libs
     
     Author: Todd Lipcon
     
- -- Todd Lipcon <todd@cloudera.com>  Fri, 08 Oct 2010 15:29:23 -0700
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 23:19:56 -0800
 
 
-hadoop-hbase (0.89.20100924+24-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit c5361373f24d793ed11cf5935649b2d0bc920658:
-    HBASE-2799. "Append not enabled" warning should not show if hbase root dir isn't on DFS
+  Commit d8fff4b8c5968c93a107266665a33bc725c2ee1c:
+    CLOUDERA-BUILD. Specify maven-source-plugin version as 2.1.2
     
-    Author: Michael Stack
+    Upstream this is inherited from the Apache parent pom, but the
+    Cloudera parent pom specifies an older version.
     
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 22:05:20 -0700
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 23:19:56 -0800
 
 
-hadoop-hbase (0.89.20100924+23-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit 3190f7406c74c716fe09f693589314c67b98b62b:
-    CLOUDERA-BUILD. cloudera directory should get installed
+  Commit 264145ec95990cf096a61208cdae95f648c904c1:
+    CLOUDERA-BUILD. CDH Mavenization.
     
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 19:56:33 -0700
+  
+  Author: Andrew Bayer <andrew.bayer@gmail.com>  Tue, 01 Feb 2011 18:01:57 -0800
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 23:19:56 -0800
 
 
-hadoop-hbase (0.89.20100924+22-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit 62bec1e3c6a34bae54dbe05bf9c473ef401eb3fd:
-    CLOUDERA-BUILD. Change wrapper scripts to not be dependent on setting a bunch of environment variables
+  Commit eff6e77cdd49771c3be5e68e15e842e0ce138f9f:
+    CLOUDERA-BUILD. Update pom.xml to CDH3b4 snapshot
     
-    Fixes issues where /usr/lib/hbase/bin/hbase would fail, not finding the hadoop jars.
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 19:20:10 -0700
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 18:27:14 -0800
 
 
-hadoop-hbase (0.89.20100924+21-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit 405eef0025bc6894c117b5d542706e18b64aa4fe:
-    HBASE-3008  Memstore.updateColumnValue passes wrong flag to heapSizeChange (Causes memstore size to go negative)
-    
-    Author: Ryan Rawson
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:48:07 -0700
-
-
-hadoop-hbase (0.89.20100924+20-1) cloudera; urgency=low
-
-  Commit 8acae9396f84c90c4b4513d4644fb30389c6847c:
-    Fix src assembly to make java libs 644, and not include hbase lib twice
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:48:06 -0700
-
-
-hadoop-hbase (0.89.20100924+19-1) cloudera; urgency=low
-
-  Commit 427f35f2dc730c553d9be1c0d78d7b695e4b2b76:
-    CLOUDERA-BUILD. Fix copy of bin/ to be cp -a
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:48:06 -0700
-
-
-hadoop-hbase (0.89.20100924+18-1) cloudera; urgency=low
-
-  Commit 4c89df680a254d41fff96a4387280a8be505a2ad:
-    CLOUDERA-BUILD. Build site as part of release build
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:48:06 -0700
-
-
-hadoop-hbase (0.89.20100924+17-1) cloudera; urgency=low
-
-  Commit 49c5812eb3c58180b3a49791afc165d93d8351ea:
-    HBASE-2782. QoS for META table access
-    
-    Author: Ryan Rawson
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:48:06 -0700
-
-
-hadoop-hbase (0.89.20100924+16-1) cloudera; urgency=low
-
-  Commit 74542880d740e9be24b103f1d5f5c6489d01911c:
-    CLOUDERA-BUILD. HBase running on secure hadoop, temporary patch.
-    
-    This is not upstreamed, since it currently is very difficult to do this
-    without reflection or a shim layer. This will be upstreamed with the
-    larger project of HBase security later this year.
-    
-    Author: Todd Lipcon
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:48:03 -0700
-
-
-hadoop-hbase (0.89.20100924+15-1) cloudera; urgency=low
-
-  Commit 5476f351a90bd028de924ad021a7f0924b20e103:
-    HBASE-3001. TableMapReduceUtil should always add dependency jars
-    
-    Author: Todd Lipcon and Michael Stack
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+14-1) cloudera; urgency=low
-
-  Commit 677ce02c0b4af1e361942e58bd8a34902cf363ca:
-    HBASE-3000. Add hbase classpath command
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+13-1) cloudera; urgency=low
-
-  Commit 59af30dd33787024b7ee43375ea47bc2b3a06674:
-    HBASE-2980. Refactor region server command line to a new class
-    
-    Author: Todd Lipcon
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+12-1) cloudera; urgency=low
-
-  Commit 313c7a888995509bfb6ad25251663d8281e6e124:
-    HBASE-2977. Refactor master command line to a new class
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+11-1) cloudera; urgency=low
-
-  Commit 6647194e4e48aba590a9fba9d3c699ee05510b16:
-    SequenceFileLogWriter doesn't need to actually call sync()
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+10-1) cloudera; urgency=low
-
-  Commit cec5868f8de0080107540234f3005f1f033d43a4:
-    HBASE-2467. Concurrent flushers in HLog sync using HDFS-895 (JD's v3 patch)
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+9-1) cloudera; urgency=low
-
-  Commit cdeff4c4e3e5c21b55b04cd36c17804f88eba88e:
+  Commit 5e4420bddcea5593f62c5b5ec07ca829a59ab3ba:
     CLOUDERA-BUILD. rsync all of lib into target directory
     
     Otherwise shell doesn't work, since we don't get .rb files
@@ -211,79 +64,26 @@ hadoop-hbase (0.89.20100924+9-1) cloudera; urgency=low
     
   
   Author: todd <todd@ubuntu64-build01.(none)>  Sun, 27 Jun 2010 23:24:58 -0700
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 18:20:37 -0800
 
 
-hadoop-hbase (0.89.20100924+8-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit e9c356f37bf195fc284e51ecd93c40b2a0b38509:
+  Commit 0f84f735501b02d3467f4a6c8f2d617bff6e6ce4:
     CLOUDERA-BUILD. hbase-config.sh should set HBASE_PID_DIR if unset
     
   
   Author: todd <todd@ubuntu64-build01.(none)>  Sun, 27 Jun 2010 22:21:29 -0700
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 18:20:37 -0800
 
 
-hadoop-hbase (0.89.20100924+7-1) cloudera; urgency=low
+hadoop-hbase (0.90.1+9-1) cloudera; urgency=low
 
-  Commit cf4dc092807fc922103366ed222bef2745320a84:
-    CLOUDERA-BUILD. Include cloudera/ dir in src assembly
-    
-  
-  Author: todd <todd@ubuntu64-build01.(none)>  Sun, 27 Jun 2010 21:52:18 -0700
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+6-1) cloudera; urgency=low
-
-  Commit 89b8bdcb7eb2837c07a03783f2065be9f69a478d:
-    HBASE-2773. Check for null values in meta in test util
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+5-1) cloudera; urgency=low
-
-  Commit 4377d51ef77152d798c7c7739a6e64c52911286c:
-    Re-enable log split test
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+4-1) cloudera; urgency=low
-
-  Commit 5457635b3f41be41bd2172b5beeb9ec8ba448a01:
-    Add VerifiableEditor
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+3-1) cloudera; urgency=low
-
-  Commit 5ac1ffdf37c28be48196eb0f4226e0ade6d3e048:
-    CLOUDERA-BUILD. Switch to CDH3b3 snapshot in todd's repo
-    
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:50 -0700
-
-
-hadoop-hbase (0.89.20100924+2-1) cloudera; urgency=low
-
-  Commit b569811d0a92da0011375e27d2b38dc04cef3c44:
+  Commit dd7467739d6ea0a0c61ce127ea3ea1280a88f147:
     CLOUDERA-BUILD. Add build infrastructure.
     
     CLOUDERA-BUILD. Build should create a "mixed" src/bin tarball, and install from that
-    
   
   Author: newalex <newalex@ubuntu64-build01.(none)>  Tue, 22 Jun 2010 12:26:19 -0700
- -- Todd Lipcon <todd@cloudera.com>  Thu, 07 Oct 2010 14:45:49 -0700
-
-
-hadoop-hbase (0.89.20100924+1-1) cloudera; urgency=low
-
-  Commit 692785c890809f1475229a398cc1dba501d6cab9:
-    Updating the site for 0.89.20100924
-    
-    
-    git-svn-id: https://svn.apache.org/repos/asf/hbase/tags/0.89.20100924RC1@1004768 13f79535-47bb-0310-9956-ffa450edef68
- -- Jean-Daniel Cryans <jdcryans@apache.org>  Tue, 05 Oct 2010 12:05:51 +0000
+ -- Todd Lipcon <todd@cloudera.com>  Mon, 14 Feb 2011 18:19:41 -0800
 

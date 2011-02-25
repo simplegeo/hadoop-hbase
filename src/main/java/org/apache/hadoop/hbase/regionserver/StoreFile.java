@@ -83,6 +83,7 @@ public class StoreFile {
   // Config keys.
   static final String IO_STOREFILE_BLOOM_ERROR_RATE = "io.storefile.bloom.error.rate";
   static final String IO_STOREFILE_BLOOM_MAX_FOLD = "io.storefile.bloom.max.fold";
+  static final String IO_STOREFILE_BLOOM_MAX_KEYS = "io.storefile.bloom.max.keys";
   static final String IO_STOREFILE_BLOOM_ENABLED = "io.storefile.bloom.enabled";
   static final String HFILE_BLOCK_CACHE_SIZE_KEY = "hfile.block.cache.size";
 
@@ -291,9 +292,6 @@ public class StoreFile {
    * @return This files maximum edit sequence id.
    */
   public long getMaxSequenceId() {
-    if (this.sequenceid == -1) {
-      throw new IllegalAccessError("Has not been initialized");
-    }
     return this.sequenceid;
   }
 
@@ -339,7 +337,7 @@ public class StoreFile {
   public static synchronized BlockCache getBlockCache(Configuration conf) {
     if (hfileBlockCache != null) return hfileBlockCache;
 
-    float cachePercentage = conf.getFloat(HFILE_BLOCK_CACHE_SIZE_KEY, 0.0f);
+    float cachePercentage = conf.getFloat(HFILE_BLOCK_CACHE_SIZE_KEY, 0.2f);
     // There should be a better way to optimize this. But oh well.
     if (cachePercentage == 0L) return null;
     if (cachePercentage > 1.0) {
@@ -370,11 +368,9 @@ public class StoreFile {
    * @see #closeReader()
    */
   private Reader open() throws IOException {
-
     if (this.reader != null) {
       throw new IllegalAccessError("Already open");
     }
-
     if (isReference()) {
       this.reader = new HalfStoreFileReader(this.fs, this.referencePath,
           getBlockCache(), this.reference);
@@ -382,7 +378,6 @@ public class StoreFile {
       this.reader = new Reader(this.fs, this.path, getBlockCache(),
           this.inMemory);
     }
-
     // Load up indices and fileinfo.
     metadataMap = Collections.unmodifiableMap(this.reader.loadFileInfo());
     // Read in our metadata.
@@ -400,6 +395,7 @@ public class StoreFile {
         }
       }
     }
+    this.reader.setSequenceID(this.sequenceid);
 
     b = metadataMap.get(MAJOR_COMPACTION_KEY);
     if (b != null) {
@@ -409,6 +405,10 @@ public class StoreFile {
       } else {
         this.majorCompaction.set(mc);
       }
+    } else {
+      // Presume it is not major compacted if it doesn't explicity say so
+      // HFileOutputFormat explicitly sets the major compacted key.
+      this.majorCompaction = new AtomicBoolean(false);
     }
 
     if (this.bloomType != BloomType.NONE) {
@@ -443,7 +443,7 @@ public class StoreFile {
   /**
    * @return Current reader.  Must call createReader first else returns null.
    * @throws IOException
-   * @see {@link #createReader()}
+   * @see #createReader()
    */
   public Reader getReader() {
     return this.reader;
@@ -692,6 +692,9 @@ public class StoreFile {
 
       this.kvComparator = comparator;
 
+      BloomFilter bloom = null;
+      BloomType bt = BloomType.NONE;
+
       if (bloomType != BloomType.NONE && conf != null) {
         float err = conf.getFloat(IO_STOREFILE_BLOOM_ERROR_RATE, (float)0.01);
         // Since in row+col blooms we have 2 calls to shouldSeek() instead of 1
@@ -702,15 +705,31 @@ public class StoreFile {
           err /= 2;
         }
         int maxFold = conf.getInt(IO_STOREFILE_BLOOM_MAX_FOLD, 7);
-
-        this.bloomFilter = new ByteBloomFilter(maxKeys, err,
-            Hash.getHashType(conf), maxFold);
-        this.bloomFilter.allocBloom();
-        this.bloomType = bloomType;
-      } else {
-        this.bloomFilter = null;
-        this.bloomType = BloomType.NONE;
+        int tooBig = conf.getInt(IO_STOREFILE_BLOOM_MAX_KEYS, 128*1000*1000);
+        
+        if (maxKeys < tooBig) { 
+          try {
+            bloom = new ByteBloomFilter(maxKeys, err,
+                Hash.getHashType(conf), maxFold);
+            bloom.allocBloom();
+            bt = bloomType;
+          } catch (IllegalArgumentException iae) {
+            LOG.warn(String.format(
+              "Parse error while creating bloom for %s (%d, %f)", 
+              path, maxKeys, err), iae);
+            bloom = null;
+            bt = BloomType.NONE;
+          }
+        } else {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Skipping bloom filter because max keysize too large: " 
+                + maxKeys);
+          }
+        }
       }
+
+      this.bloomFilter = bloom;
+      this.bloomType = bt;
     }
 
     /**
@@ -821,6 +840,10 @@ public class StoreFile {
     public Path getPath() {
       return this.writer.getPath();
     }
+    
+    boolean hasBloom() { 
+      return this.bloomFilter != null;
+    }
 
     public void append(final byte [] key, final byte [] value) throws IOException {
       if (this.bloomFilter != null) {
@@ -842,7 +865,8 @@ public class StoreFile {
           int b = this.bloomFilter.getByteSize();
           int k = this.bloomFilter.getKeyCount();
           int m = this.bloomFilter.getMaxKeys();
-          StoreFile.LOG.info("Bloom added to HFile.  " + b + "B, " +
+          StoreFile.LOG.info("Bloom added to HFile (" + 
+              getPath() + "): " + StringUtils.humanReadableInt(b) + ", " +
               k + "/" + m + " (" + NumberFormat.getPercentInstance().format(
                 ((double)k) / ((double)m)) + ")");
         }
@@ -868,6 +892,7 @@ public class StoreFile {
     protected BloomType bloomFilterType;
     private final HFile.Reader reader;
     protected TimeRangeTracker timeRangeTracker = null;
+    protected long sequenceID = -1;
 
     public Reader(FileSystem fs, Path path, BlockCache blockCache, boolean inMemory)
         throws IOException {
@@ -1049,6 +1074,14 @@ public class StoreFile {
 
     public BloomType getBloomFilterType() {
       return this.bloomFilterType;
+    }
+
+    public long getSequenceID() {
+      return sequenceID;
+    }
+
+    public void setSequenceID(long sequenceID) {
+      this.sequenceID = sequenceID;
     }
   }
 

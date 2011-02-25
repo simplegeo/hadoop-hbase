@@ -24,16 +24,28 @@ import static org.junit.Assert.*;
 import java.io.IOException;
 import java.util.NavigableSet;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
+import org.apache.hadoop.hbase.KeyValueTestUtil;
+import org.apache.hadoop.hbase.MultithreadedTestUtil;
+import org.apache.hadoop.hbase.MultithreadedTestUtil.TestContext;
+import org.apache.hadoop.hbase.MultithreadedTestUtil.TestThread;
+import org.apache.hadoop.hbase.regionserver.wal.HLogSplitter.EntryBuffers;
+import org.apache.hadoop.hbase.regionserver.wal.HLogSplitter.RegionEntryBuffer;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.Test;
+import static org.mockito.Mockito.mock;
 
 /**
  * Simple testing of a few HLog methods.
  */
 public class TestHLogMethods {
+  private static final byte[] TEST_REGION = Bytes.toBytes("test_region");;
+  private static final byte[] TEST_TABLE = Bytes.toBytes("test_table");
+  
   private final HBaseTestingUtility util = new HBaseTestingUtility();
 
   /**
@@ -47,14 +59,16 @@ public class TestHLogMethods {
     fs.delete(regiondir, true);
     fs.mkdirs(regiondir);
     Path recoverededits = HLog.getRegionDirRecoveredEditsDir(regiondir);
-    String first = HLog.formatRecoveredEditsFileName(-1);
+    String first = HLogSplitter.formatRecoveredEditsFileName(-1);
     createFile(fs, recoverededits, first);
-    createFile(fs, recoverededits, HLog.formatRecoveredEditsFileName(0));
-    createFile(fs, recoverededits, HLog.formatRecoveredEditsFileName(1));
-    createFile(fs, recoverededits, HLog.formatRecoveredEditsFileName(11));
-    createFile(fs, recoverededits, HLog.formatRecoveredEditsFileName(2));
-    createFile(fs, recoverededits, HLog.formatRecoveredEditsFileName(50));
-    String last = HLog.formatRecoveredEditsFileName(Long.MAX_VALUE);
+    createFile(fs, recoverededits, HLogSplitter.formatRecoveredEditsFileName(0));
+    createFile(fs, recoverededits, HLogSplitter.formatRecoveredEditsFileName(1));
+    createFile(fs, recoverededits, HLogSplitter
+        .formatRecoveredEditsFileName(11));
+    createFile(fs, recoverededits, HLogSplitter.formatRecoveredEditsFileName(2));
+    createFile(fs, recoverededits, HLogSplitter
+        .formatRecoveredEditsFileName(50));
+    String last = HLogSplitter.formatRecoveredEditsFileName(Long.MAX_VALUE);
     createFile(fs, recoverededits, last);
     createFile(fs, recoverededits,
       Long.toString(Long.MAX_VALUE) + "." + System.currentTimeMillis());
@@ -63,13 +77,17 @@ public class TestHLogMethods {
     assertEquals(files.pollFirst().getName(), first);
     assertEquals(files.pollLast().getName(), last);
     assertEquals(files.pollFirst().getName(),
-      HLog.formatRecoveredEditsFileName(0));
+      HLogSplitter
+        .formatRecoveredEditsFileName(0));
     assertEquals(files.pollFirst().getName(),
-      HLog.formatRecoveredEditsFileName(1));
+      HLogSplitter
+        .formatRecoveredEditsFileName(1));
     assertEquals(files.pollFirst().getName(),
-      HLog.formatRecoveredEditsFileName(2));
+      HLogSplitter
+        .formatRecoveredEditsFileName(2));
     assertEquals(files.pollFirst().getName(),
-      HLog.formatRecoveredEditsFileName(11));
+      HLogSplitter
+        .formatRecoveredEditsFileName(11));
   }
 
   private void createFile(final FileSystem fs, final Path testdir,
@@ -77,5 +95,72 @@ public class TestHLogMethods {
   throws IOException {
     FSDataOutputStream fdos = fs.create(new Path(testdir, name), true);
     fdos.close();
+  }
+
+  @Test
+  public void testRegionEntryBuffer() throws Exception {
+    HLogSplitter.RegionEntryBuffer reb = new HLogSplitter.RegionEntryBuffer(
+        TEST_TABLE, TEST_REGION);
+    assertEquals(0, reb.heapSize());
+
+    reb.appendEntry(createTestLogEntry(1));
+    assertTrue(reb.heapSize() > 0);
+  }
+  
+  @Test
+  public void testEntrySink() throws Exception {
+    Configuration conf = new Configuration();
+    HLogSplitter splitter = HLogSplitter.createLogSplitter(
+        conf, mock(Path.class), mock(Path.class), mock(Path.class),
+        mock(FileSystem.class));
+
+    EntryBuffers sink = splitter.new EntryBuffers(1*1024*1024);
+    for (int i = 0; i < 1000; i++) {
+      HLog.Entry entry = createTestLogEntry(i);
+      sink.appendEntry(entry);
+    }
+    
+    assertTrue(sink.totalBuffered > 0);
+    long amountInChunk = sink.totalBuffered;
+    // Get a chunk
+    RegionEntryBuffer chunk = sink.getChunkToWrite();
+    assertEquals(chunk.heapSize(), amountInChunk);
+    
+    // Make sure it got marked that a thread is "working on this"
+    assertTrue(sink.isRegionCurrentlyWriting(TEST_REGION));
+
+    // Insert some more entries
+    for (int i = 0; i < 500; i++) {
+      HLog.Entry entry = createTestLogEntry(i);
+      sink.appendEntry(entry);
+    }    
+    // Asking for another chunk shouldn't work since the first one
+    // is still writing
+    assertNull(sink.getChunkToWrite());
+    
+    // If we say we're done writing the first chunk, then we should be able
+    // to get the second
+    sink.doneWriting(chunk);
+    
+    RegionEntryBuffer chunk2 = sink.getChunkToWrite();
+    assertNotNull(chunk2);
+    assertNotSame(chunk, chunk2);
+    long amountInChunk2 = sink.totalBuffered;
+    // The second chunk had fewer rows than the first
+    assertTrue(amountInChunk2 < amountInChunk);
+    
+    sink.doneWriting(chunk2);
+    assertEquals(0, sink.totalBuffered);
+  }
+  
+  private HLog.Entry createTestLogEntry(int i) {
+    long seq = i;
+    long now = i * 1000;
+    
+    WALEdit edit = new WALEdit();
+    edit.add(KeyValueTestUtil.create("row", "fam", "qual", 1234, "val"));
+    HLogKey key = new HLogKey(TEST_REGION, TEST_TABLE, seq, now);
+    HLog.Entry entry = new HLog.Entry(key, edit);
+    return entry;
   }
 }

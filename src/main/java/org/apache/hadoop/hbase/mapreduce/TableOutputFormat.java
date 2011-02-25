@@ -23,18 +23,20 @@ import java.io.IOException;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.conf.Configurable;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Delete;
+import org.apache.hadoop.hbase.client.HConnectionManager;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapreduce.JobContext;
 import org.apache.hadoop.mapreduce.OutputCommitter;
 import org.apache.hadoop.mapreduce.OutputFormat;
 import org.apache.hadoop.mapreduce.RecordWriter;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
-import org.apache.hadoop.conf.Configuration;
 
 /**
  * Convert Map/Reduce output and write it to an HBase table. The KEY is ignored
@@ -43,19 +45,33 @@ import org.apache.hadoop.conf.Configuration;
  *
  * @param <KEY>  The type of the key. Ignored in this class.
  */
-public class TableOutputFormat<KEY> extends OutputFormat<KEY, Writable> {
+public class TableOutputFormat<KEY> extends OutputFormat<KEY, Writable>
+implements Configurable {
 
   private final Log LOG = LogFactory.getLog(TableOutputFormat.class);
+
   /** Job parameter that specifies the output table. */
   public static final String OUTPUT_TABLE = "hbase.mapred.outputtable";
-  /** Optional job parameter to specify a peer cluster */
+
+  /**
+   * Optional job parameter to specify a peer cluster.
+   * Used specifying remote cluster when copying between hbase clusters (the
+   * source is picked up from <code>hbase-site.xml</code>).
+   * @see TableMapReduceUtil#initTableReducerJob(String, Class, org.apache.hadoop.mapreduce.Job, Class, String, String, String)
+   */
   public static final String QUORUM_ADDRESS = "hbase.mapred.output.quorum";
+
   /** Optional specification of the rs class name of the peer cluster */
   public static final String
       REGION_SERVER_CLASS = "hbase.mapred.output.rs.class";
   /** Optional specification of the rs impl name of the peer cluster */
   public static final String
       REGION_SERVER_IMPL = "hbase.mapred.output.rs.impl";
+
+  /** The configuration. */
+  private Configuration conf = null;
+
+  private HTable table;
 
   /**
    * Writes the reducer output to an HBase table.
@@ -88,6 +104,12 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Writable> {
     public void close(TaskAttemptContext context)
     throws IOException {
       table.flushCommits();
+      // The following call will shutdown all connections to the cluster from
+      // this JVM.  It will close out our zk session otherwise zk wil log
+      // expired sessions rather than closed ones.  If any other HTable instance
+      // running in this JVM, this next call will cause it damage.  Presumption
+      // is that the above this.table is only instance.
+      HConnectionManager.deleteAllConnections(true);
     }
 
     /**
@@ -120,32 +142,7 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Writable> {
   public RecordWriter<KEY, Writable> getRecordWriter(
     TaskAttemptContext context)
   throws IOException, InterruptedException {
-    // expecting exactly one path
-    Configuration conf = new Configuration(context.getConfiguration());
-    String tableName = conf.get(OUTPUT_TABLE);
-    String address = conf.get(QUORUM_ADDRESS);
-    String serverClass = conf.get(REGION_SERVER_CLASS);
-    String serverImpl = conf.get(REGION_SERVER_IMPL);
-    HTable table = null;
-    try {
-      HBaseConfiguration.addHbaseResources(conf);
-      if (address != null) {
-        // Check is done in TMRU
-        String[] parts = address.split(":");
-        conf.set(HConstants.ZOOKEEPER_QUORUM, parts[0]);
-        conf.set(HConstants.ZOOKEEPER_ZNODE_PARENT, parts[1]);
-      }
-      if (serverClass != null) {
-        conf.set(HConstants.REGION_SERVER_CLASS, serverClass);
-        conf.set(HConstants.REGION_SERVER_IMPL, serverImpl);
-      }
-      table = new HTable(conf, tableName);
-    } catch(IOException e) {
-      LOG.error(e);
-      throw e;
-    }
-    table.setAutoFlush(false);
-    return new TableRecordWriter<KEY>(table);
+    return new TableRecordWriter<KEY>(this.table);
   }
 
   /**
@@ -178,4 +175,29 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Writable> {
     return new TableOutputCommitter();
   }
 
+  public Configuration getConf() {
+    return conf;
+  }
+
+  @Override
+  public void setConf(Configuration conf) {
+    String tableName = conf.get(OUTPUT_TABLE);
+    String address = conf.get(QUORUM_ADDRESS);
+    String serverClass = conf.get(REGION_SERVER_CLASS);
+    String serverImpl = conf.get(REGION_SERVER_IMPL);
+    try {
+      if (address != null) {
+        ZKUtil.applyClusterKeyToConf(conf, address);
+      }
+      if (serverClass != null) {
+        conf.set(HConstants.REGION_SERVER_CLASS, serverClass);
+        conf.set(HConstants.REGION_SERVER_IMPL, serverImpl);
+      }
+      this.table = new HTable(conf, tableName);
+      table.setAutoFlush(false);
+      LOG.info("Created table instance for "  + tableName);
+    } catch(IOException e) {
+      LOG.error(e);
+    }
+  }
 }

@@ -103,11 +103,26 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
       // old format region name. ROOT and first META region also 
       // use this format.EncodedName is the JenkinsHash value.
       int hashVal = Math.abs(JenkinsHash.getInstance().hash(regionName,
-                                                            regionName.length,
-                                                            0));
+        regionName.length, 0));
       encodedName = String.valueOf(hashVal);
     }
     return encodedName;
+  }
+
+  /**
+   * Use logging.
+   * @param encodedRegionName The encoded regionname.
+   * @return <code>-ROOT-</code> if passed <code>70236052</code> or
+   * <code>.META.</code> if passed </code>1028785192</code> else returns
+   * <code>encodedRegionName</code>
+   */
+  public static String prettyPrint(final String encodedRegionName) {
+    if (encodedRegionName.equals("70236052")) {
+      return encodedRegionName + "/-ROOT-";
+    } else if (encodedRegionName.equals("1028785192")) {
+      return encodedRegionName + "/.META.";
+    }
+    return encodedRegionName;
   }
 
   /** delimiter used between portions of a region name */
@@ -122,6 +137,9 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
     new HRegionInfo(1L, HTableDescriptor.META_TABLEDESC);
 
   private byte [] endKey = HConstants.EMPTY_BYTE_ARRAY;
+  // This flag is in the parent of a split while the parent is still referenced
+  // by daughter regions.  We USED to set this flag when we disabled a table
+  // but now table state is kept up in zookeeper as of 0.90.0 HBase.
   private boolean offLine = false;
   private long regionId = -1;
   private transient byte [] regionName = HConstants.EMPTY_BYTE_ARRAY;
@@ -133,6 +151,7 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
   //TODO: Move NO_HASH to HStoreFile which is really the only place it is used.
   public static final String NO_HASH = null;
   private volatile String encodedName = NO_HASH;
+  private byte [] encodedNameAsBytes = null;
 
   private void setHashCode() {
     int result = Arrays.hashCode(this.regionName);
@@ -245,7 +264,16 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
     this.encodedName = other.getEncodedName();
   }
 
-  private static byte [] createRegionName(final byte [] tableName,
+  /**
+   * Make a region name of passed parameters.
+   * @param tableName
+   * @param startKey Can be null
+   * @param regionid Region id (Usually timestamp from when region was created).
+   * @param newFormat should we create the region name in the new format
+   *                  (such that it contains its encoded name?).
+   * @return Region name made of passed tableName, startKey and id
+   */
+  public static byte [] createRegionName(final byte [] tableName,
       final byte [] startKey, final long regionid, boolean newFormat) {
     return createRegionName(tableName, startKey, Long.toString(regionid), newFormat);
   }
@@ -254,7 +282,7 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
    * Make a region name of passed parameters.
    * @param tableName
    * @param startKey Can be null
-   * @param id Region id.
+   * @param id Region id (Usually timestamp from when region was created).
    * @param newFormat should we create the region name in the new format
    *                  (such that it contains its encoded name?).
    * @return Region name made of passed tableName, startKey and id
@@ -263,11 +291,12 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
       final byte [] startKey, final String id, boolean newFormat) {
     return createRegionName(tableName, startKey, Bytes.toBytes(id), newFormat);
   }
+
   /**
    * Make a region name of passed parameters.
    * @param tableName
    * @param startKey Can be null
-   * @param id Region id
+   * @param id Region id (Usually timestamp from when region was created).
    * @param newFormat should we create the region name in the new format
    *                  (such that it contains its encoded name?).
    * @return Region name made of passed tableName, startKey and id
@@ -313,6 +342,24 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
     }
     
     return b;
+  }
+
+  /**
+   * Gets the table name from the specified region name.
+   * @param regionName
+   * @return Table name.
+   */
+  public static byte [] getTableName(byte [] regionName) {
+    int offset = -1;
+    for (int i = 0; i < regionName.length; i++) {
+      if (regionName[i] == DELIMITER) {
+        offset = i;
+        break;
+      }
+    }
+    byte [] tableName = new byte[offset];
+    System.arraycopy(regionName, 0, tableName, 0, offset);
+    return tableName;
   }
 
   /**
@@ -391,6 +438,13 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
       this.encodedName = encodeRegionName(this.regionName);
     }
     return this.encodedName;
+  }
+
+  public synchronized byte [] getEncodedNameAsBytes() {
+    if (this.encodedNameAsBytes == null) {
+      this.encodedNameAsBytes = Bytes.toBytes(getEncodedName());
+    }
+    return this.encodedNameAsBytes;
   }
 
   /** @return the startKey */
@@ -482,10 +536,24 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
   }
 
   /**
-   * @param offLine set online - offline status
+   * The parent of a region split is offline while split daughters hold
+   * references to the parent. Offlined regions are closed.
+   * @param offLine Set online/offline status.
    */
   public void setOffline(boolean offLine) {
     this.offLine = offLine;
+  }
+
+
+  /**
+   * @return True if this is a split parent region.
+   */
+  public boolean isSplitParent() {
+    if (!isSplit()) return false;
+    if (!isOffline()) {
+      LOG.warn("Region is split but NOT offline: " + getRegionNameAsString());
+    }
+    return true;
   }
 
   /**
@@ -576,7 +644,7 @@ public class HRegionInfo extends VersionedWritable implements WritableComparable
     }
 
     // Are regions of same table?
-    int result = this.tableDesc.compareTo(o.tableDesc);
+    int result = Bytes.compareTo(this.tableDesc.getName(), o.tableDesc.getName());
     if (result != 0) {
       return result;
     }

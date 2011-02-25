@@ -103,7 +103,7 @@ public class MetaUtils {
           HConstants.HREGION_LOGDIR_NAME + "_" + System.currentTimeMillis());
       Path oldLogDir = new Path(this.fs.getHomeDirectory(),
           HConstants.HREGION_OLDLOGDIR_NAME);
-      this.log = new HLog(this.fs, logdir, oldLogDir, this.conf, null);
+      this.log = new HLog(this.fs, logdir, oldLogDir, this.conf);
     }
     return this.log;
   }
@@ -266,15 +266,14 @@ public class MetaUtils {
     if (this.rootRegion != null) {
       return this.rootRegion;
     }
-    this.rootRegion = HRegion.openHRegion(HRegionInfo.ROOT_REGIONINFO,
-      this.rootdir, getLog(), this.conf);
+    this.rootRegion = HRegion.openHRegion(HRegionInfo.ROOT_REGIONINFO, getLog(),
+      this.conf);
     this.rootRegion.compactStores();
     return this.rootRegion;
   }
 
   private HRegion openMetaRegion(HRegionInfo metaInfo) throws IOException {
-    HRegion meta =
-      HRegion.openHRegion(metaInfo, this.rootdir, getLog(), this.conf);
+    HRegion meta = HRegion.openHRegion(metaInfo, getLog(), this.conf);
     meta.compactStores();
     return meta;
   }
@@ -475,14 +474,5 @@ public class MetaUtils {
         return true;
       }});
     return result;
-  }
-
-  /**
-   * @param n Table name.
-   * @return True if a catalog table, -ROOT- or .META.
-   */
-  public static boolean isMetaTableName(final byte [] n) {
-    return Bytes.equals(n, HConstants.ROOT_TABLE_NAME) ||
-      Bytes.equals(n, HConstants.META_TABLE_NAME);
   }
 }

@@ -1189,6 +1189,31 @@ public class KeyValue implements Writable, HeapSize {
   }
 
   /**
+   * Converts this KeyValue to only contain the key portion (the value is
+   * changed to be null).  This method does a full copy of the backing byte
+   * array and does not modify the original byte array of this KeyValue.
+   * <p>
+   * This method is used by <code>KeyOnlyFilter</code> and is an advanced feature of
+   * KeyValue, proceed with caution.
+   * @param lenAsVal replace value with the actual value length (false=empty)
+   */
+  public void convertToKeyOnly(boolean lenAsVal) {
+    // KV format:  <keylen:4><valuelen:4><key:keylen><value:valuelen>
+    // Rebuild as: <keylen:4><0:4><key:keylen>
+    int dataLen = lenAsVal? Bytes.SIZEOF_INT : 0;
+    byte [] newBuffer = new byte[getKeyLength() + (2 * Bytes.SIZEOF_INT) + dataLen];
+    System.arraycopy(this.bytes, this.offset, newBuffer, 0, 
+        Math.min(newBuffer.length,this.length));
+    Bytes.putInt(newBuffer, Bytes.SIZEOF_INT, dataLen);
+    if (lenAsVal) {
+      Bytes.putInt(newBuffer, newBuffer.length - dataLen, this.getValueLength());
+    }
+    this.bytes = newBuffer;
+    this.offset = 0;
+    this.length = newBuffer.length;
+  }
+
+  /**
    * Splits a column in family:qualifier form into separate byte arrays.
    * <p>
    * Not recommend to be used as this is old-style API.
@@ -1650,6 +1675,31 @@ public class KeyValue implements Writable, HeapSize {
   }
 
   /**
+   * Create a KeyValue for the specified row, family and qualifier that would be
+   * larger than or equal to all other possible KeyValues that have the same
+   * row, family, qualifier.
+   * Used for reseeking.
+   * @param row row key
+   * @param roffset row offset
+   * @param rlength row length
+   * @param family family name
+   * @param foffset family offset
+   * @param flength family length
+   * @param qualifier column qualifier
+   * @param qoffset qualifier offset
+   * @param qlength qualifier length
+   * @return Last possible key on passed row, family, qualifier.
+   */
+  public static KeyValue createLastOnRow(final byte [] row,
+      final int roffset, final int rlength, final byte [] family,
+      final int foffset, final int flength, final byte [] qualifier,
+      final int qoffset, final int qlength) {
+    return new KeyValue(row, roffset, rlength, family,
+        foffset, flength, qualifier, qoffset, qlength,
+        HConstants.OLDEST_TIMESTAMP, Type.Minimum, null, 0, 0);
+  }
+
+  /**
    * @param b
    * @return A KeyValue made of a byte array that holds the key-only part.
    * Needed to convert hfile index members to KeyValues.
@@ -1905,7 +1955,7 @@ public class KeyValue implements Writable, HeapSize {
   // HeapSize
   public long heapSize() {
     return ClassSize.align(ClassSize.OBJECT + (2 * ClassSize.REFERENCE) +
-        ClassSize.align(ClassSize.ARRAY + length) +
+        ClassSize.align(ClassSize.ARRAY) + ClassSize.align(length) +
         (3 * Bytes.SIZEOF_INT) +
         ClassSize.align(ClassSize.ARRAY) +
         (2 * Bytes.SIZEOF_LONG));

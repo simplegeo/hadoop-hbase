@@ -24,6 +24,7 @@ package org.apache.hadoop.hbase;
  * HRegionServer serving the region
  */
 public class HRegionLocation implements Comparable<HRegionLocation> {
+  // TODO: Is this class necessary?  Why not just have a Pair?
   private HRegionInfo regionInfo;
   private HServerAddress serverAddress;
 
@@ -44,7 +45,7 @@ public class HRegionLocation implements Comparable<HRegionLocation> {
   @Override
   public String toString() {
     return "address: " + this.serverAddress.toString() + ", regioninfo: " +
-      this.regionInfo;
+      this.regionInfo.getRegionNameAsString();
   }
 
   /**

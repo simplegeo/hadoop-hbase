@@ -37,7 +37,7 @@ import org.apache.hadoop.io.compress.DefaultCodec;
 
 /**
  * Implementation of {@link HLog.Writer} that delegates to
- * {@link SequenceFile.Writer}.
+ * SequenceFile.Writer.
  */
 public class SequenceFileLogWriter implements HLog.Writer {
   private final Log LOG = LogFactory.getLog(this.getClass());
@@ -48,21 +48,41 @@ public class SequenceFileLogWriter implements HLog.Writer {
   // The syncFs method from hdfs-200 or null if not available.
   private Method syncFs;
 
+  private Class<? extends HLogKey> keyClass;
+
+  /**
+   * Default constructor.
+   */
   public SequenceFileLogWriter() {
     super();
   }
 
+  /**
+   * This constructor allows a specific HLogKey implementation to override that
+   * which would otherwise be chosen via configuration property.
+   * 
+   * @param keyClass
+   */
+  public SequenceFileLogWriter(Class<? extends HLogKey> keyClass) {
+    this.keyClass = keyClass;
+  }
+  
   @Override
   public void init(FileSystem fs, Path path, Configuration conf)
       throws IOException {
+
+    if (null == keyClass) {
+      keyClass = HLog.getKeyClass(conf);
+    }
+
     // Create a SF.Writer instance.
     this.writer = SequenceFile.createWriter(fs, conf, path,
-      HLog.getKeyClass(conf), WALEdit.class,
+      keyClass, WALEdit.class,
       fs.getConf().getInt("io.file.buffer.size", 4096),
       (short) conf.getInt("hbase.regionserver.hlog.replication",
-        fs.getDefaultReplication()),
+      fs.getDefaultReplication()),
       conf.getLong("hbase.regionserver.hlog.blocksize",
-        fs.getDefaultBlockSize()),
+      fs.getDefaultBlockSize()),
       SequenceFile.CompressionType.NONE,
       new DefaultCodec(),
       null,
@@ -91,7 +111,8 @@ public class SequenceFileLogWriter implements HLog.Writer {
     // Now do dirty work to see if syncFs is available.
     // Test if syncfs is available.
     Method m = null;
-    if (conf.getBoolean("dfs.support.append", false)) {
+    boolean append = conf.getBoolean("dfs.support.append", false);
+    if (append) {
       try {
         // function pointer to writer.syncFs()
         m = this.writer.getClass().getMethod("syncFs", new Class<?> []{});
@@ -103,7 +124,8 @@ public class SequenceFileLogWriter implements HLog.Writer {
     }
     this.syncFs = m;
     LOG.info((this.syncFs != null)?
-      "Using syncFs -- HDFS-200": "syncFs -- HDFS-200 -- not available");
+      "Using syncFs -- HDFS-200":
+      ("syncFs -- HDFS-200 -- not available, dfs.support.append=" + append));
   }
 
   @Override

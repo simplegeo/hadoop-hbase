@@ -93,16 +93,6 @@ public final class HConstants {
   /** Name of ZooKeeper config file in conf/ directory. */
   public static final String ZOOKEEPER_CONFIG_NAME = "zoo.cfg";
 
-  /** Parameter name for number of times to retry writes to ZooKeeper. */
-  public static final String ZOOKEEPER_RETRIES = "zookeeper.retries";
-  /** Default number of times to retry writes to ZooKeeper. */
-  public static final int DEFAULT_ZOOKEEPER_RETRIES = 5;
-
-  /** Parameter name for ZooKeeper pause between retries. In milliseconds. */
-  public static final String ZOOKEEPER_PAUSE = "zookeeper.pause";
-  /** Default ZooKeeper pause value. In milliseconds. */
-  public static final int DEFAULT_ZOOKEEPER_PAUSE = 2 * 1000;
-
   /** default client port that the zookeeper listens on */
   public static final int DEFAULT_ZOOKEPER_CLIENT_PORT = 2181;
 
@@ -129,9 +119,15 @@ public final class HConstants {
   /** Default region server interface class name. */
   public static final String DEFAULT_REGION_SERVER_CLASS = HRegionInterface.class.getName();
 
+  /** Parameter name for what master implementation to use. */
+  public static final String MASTER_IMPL= "hbase.master.impl";
+
   /** Parameter name for how often threads should wake up */
   public static final String THREAD_WAKE_FREQUENCY = "hbase.server.thread.wakefrequency";
 
+  /** Default value for thread wake frequency */
+  public static final int DEFAULT_THREAD_WAKE_FREQUENCY = 10 * 1000;
+  
   /** Parameter name for how often a region should should perform a major compaction */
   public static final String MAJOR_COMPACTION_PERIOD = "hbase.hregion.majorcompaction";
 
@@ -197,9 +193,6 @@ public final class HConstants {
   /** The catalog family */
   public static final byte [] CATALOG_FAMILY = Bytes.toBytes(CATALOG_FAMILY_STR);
 
-  /** The catalog historian family */
-  public static final byte [] CATALOG_HISTORIAN_FAMILY = Bytes.toBytes("historian");
-
   /** The regioninfo column qualifier */
   public static final byte [] REGIONINFO_QUALIFIER = Bytes.toBytes("regioninfo");
 
@@ -254,6 +247,11 @@ public final class HConstants {
   public static final long LATEST_TIMESTAMP = Long.MAX_VALUE;
 
   /**
+   * Timestamp to use when we want to refer to the oldest cell.
+   */
+  public static final long OLDEST_TIMESTAMP = Long.MIN_VALUE;
+
+  /**
    * LATEST_TIMESTAMP in bytes form
    */
   public static final byte [] LATEST_TIMESTAMP_BYTES = Bytes.toBytes(LATEST_TIMESTAMP);
@@ -273,11 +271,6 @@ public final class HConstants {
    * Seconds in a week
    */
   public static final int WEEK_IN_SECONDS = 7 * 24 * 3600;
-
-  //TODO: HBASE_CLIENT_RETRIES_NUMBER_KEY is only used by TestMigrate. Move it
-  //      there.
-  public static final String HBASE_CLIENT_RETRIES_NUMBER_KEY =
-    "hbase.client.retries.number";
 
   //TODO: although the following are referenced widely to format strings for
   //      the shell. They really aren't a part of the public API. It would be
@@ -343,16 +336,33 @@ public final class HConstants {
    * HRegion server lease period in milliseconds. Clients must report in within this period
    * else they are considered dead. Unit measured in ms (milliseconds).
    */
-  public static String HBASE_REGIONSERVER_LEASE_PERIOD_KEY   = "hbase.regionserver.lease.period";
+  public static String HBASE_REGIONSERVER_LEASE_PERIOD_KEY =
+    "hbase.regionserver.lease.period";
 
 
   /**
    * Default value of {@link #HBASE_REGIONSERVER_LEASE_PERIOD_KEY}.
    */
   public static long DEFAULT_HBASE_REGIONSERVER_LEASE_PERIOD = 60000;
+  
+  /**
+   * timeout for each RPC
+   */
+  public static String HBASE_RPC_TIMEOUT_KEY = "hbase.rpc.timeout";
+  
+  /**
+   * Default value of {@link #HBASE_RPC_TIMEOUT_KEY}
+   */
+  public static int DEFAULT_HBASE_RPC_TIMEOUT = 60000;
 
   public static final String
       REPLICATION_ENABLE_KEY = "hbase.replication";
+
+  /** HBCK special code name used as server name when manipulating ZK nodes */
+  public static final String HBCK_CODE_NAME = "HBCKServerName";
+
+  public static final String HBASE_MASTER_LOGCLEANER_PLUGINS =
+      "hbase.master.logcleaner.plugins";
 
   private HConstants() {
     // Can't be instantiated with this ctor.

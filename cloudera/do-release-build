@@ -10,9 +10,8 @@ BIN_DIR=$(readlink -f $(dirname $0))
 RELEASE_DIR=$BIN_DIR/..
 
 cd $RELEASE_DIR
+mvn -DskipTests clean site install assembly:assembly $DO_MAVEN_DEPLOY
 
-mvn -DskipTests clean
-mvn -DskipTests -Dhbase.version=${FULL_VERSION} site install assembly:assembly 
 mkdir -p build
 for x in target/*.tar.gz ; do
   tar -C build -xzf $x

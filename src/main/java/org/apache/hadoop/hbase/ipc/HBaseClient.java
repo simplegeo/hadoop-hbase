@@ -23,8 +23,10 @@ package org.apache.hadoop.hbase.ipc;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.ObjectWritable;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableUtils;
 import org.apache.hadoop.ipc.RemoteException;
@@ -77,13 +79,16 @@ public class HBaseClient {
   final protected long failureSleep; // Time to sleep before retry on failure.
   protected final boolean tcpNoDelay; // if T then disable Nagle's Algorithm
   protected final boolean tcpKeepAlive; // if T then use keepalives
-  protected final int pingInterval; // how often sends ping to the server in msecs
+  protected int pingInterval; // how often sends ping to the server in msecs
+  protected int socketTimeout; // socket timeout
 
   protected final SocketFactory socketFactory;           // how to create sockets
   private int refCount = 1;
 
   final private static String PING_INTERVAL_NAME = "ipc.ping.interval";
-  final static int DEFAULT_PING_INTERVAL = 60000; // 1 min
+  final private static String SOCKET_TIMEOUT = "ipc.socket.timeout";
+  final static int DEFAULT_PING_INTERVAL = 60000;  // 1 min
+  final static int DEFAULT_SOCKET_TIMEOUT = 20000; // 20 seconds
   final static int PING_CALL_ID = -1;
 
   /**
@@ -92,7 +97,6 @@ public class HBaseClient {
    * @param conf Configuration
    * @param pingInterval the ping interval
    */
-  @SuppressWarnings({"UnusedDeclaration"})
   public static void setPingInterval(Configuration conf, int pingInterval) {
     conf.setInt(PING_INTERVAL_NAME, pingInterval);
   }
@@ -106,6 +110,22 @@ public class HBaseClient {
    */
   static int getPingInterval(Configuration conf) {
     return conf.getInt(PING_INTERVAL_NAME, DEFAULT_PING_INTERVAL);
+  }
+
+  /**
+   * Set the socket timeout
+   * @param conf Configuration
+   * @param socketTimeout the socket timeout
+   */
+  public static void setSocketTimeout(Configuration conf, int socketTimeout) {
+    conf.setInt(SOCKET_TIMEOUT, socketTimeout);
+  }
+
+  /**
+   * @return the socket timeout
+   */
+  static int getSocketTimeout(Configuration conf) {
+    return conf.getInt(SOCKET_TIMEOUT, DEFAULT_SOCKET_TIMEOUT);
   }
 
   /**
@@ -192,7 +212,7 @@ public class HBaseClient {
     private IOException closeException; // close reason
 
     public Connection(InetSocketAddress address) throws IOException {
-      this(new ConnectionId(address, null));
+      this(new ConnectionId(address, null, 0));
     }
 
     public Connection(ConnectionId remoteId) throws IOException {
@@ -243,7 +263,8 @@ public class HBaseClient {
        * otherwise, throw the timeout exception.
        */
       private void handleTimeout(SocketTimeoutException e) throws IOException {
-        if (shouldCloseConnection.get() || !running.get()) {
+        if (shouldCloseConnection.get() || !running.get() || 
+            remoteId.rpcTimeout > 0) {
           throw e;
         }
         sendPing();
@@ -304,8 +325,11 @@ public class HBaseClient {
             this.socket = socketFactory.createSocket();
             this.socket.setTcpNoDelay(tcpNoDelay);
             this.socket.setKeepAlive(tcpKeepAlive);
-            // connection time out is 20s
-            NetUtils.connect(this.socket, remoteId.getAddress(), 20000);
+            NetUtils.connect(this.socket, remoteId.getAddress(),
+              getSocketTimeout(conf));
+            if (remoteId.rpcTimeout > 0) {
+              pingInterval = remoteId.rpcTimeout; // overwrite pingInterval
+            }
             this.socket.setSoTimeout(pingInterval);
             break;
           } catch (SocketTimeoutException toe) {
@@ -384,7 +408,8 @@ public class HBaseClient {
       out.write(HBaseServer.CURRENT_VERSION);
       //When there are more fields we can have ConnectionHeader Writable.
       DataOutputBuffer buf = new DataOutputBuffer();
-      WritableUtils.writeString(buf, remoteId.getTicket().getUserName());
+      ObjectWritable.writeObject(buf, remoteId.getTicket(),
+                                 UserGroupInformation.class, conf);
       int bufLen = buf.getLength();
       out.writeInt(bufLen);
       out.write(buf.getData(), 0, bufLen);
@@ -482,12 +507,14 @@ public class HBaseClient {
           //for serializing the
           //data to be written
           d = new DataOutputBuffer();
+          d.writeInt(0xdeadbeef); // placeholder for data length
           d.writeInt(call.id);
           call.param.write(d);
           byte[] data = d.getData();
           int dataLength = d.getLength();
-          out.writeInt(dataLength);      //first put the data length
-          out.write(data, 0, dataLength);//write the data
+          // fill in the placeholder
+          Bytes.putInt(data, 0, dataLength - 4);
+          out.write(data, 0, dataLength);
           out.flush();
         }
       } catch(IOException e) {
@@ -648,7 +675,7 @@ public class HBaseClient {
     this.maxIdleTime =
       conf.getInt("hbase.ipc.client.connection.maxidletime", 10000); //10s
     this.maxRetries = conf.getInt("hbase.ipc.client.connect.max.retries", 0);
-    this.failureSleep = conf.getInt("hbase.client.pause", 2000);
+    this.failureSleep = conf.getInt("hbase.client.pause", 1000);
     this.tcpNoDelay = conf.getBoolean("hbase.ipc.client.tcpnodelay", false);
     this.tcpKeepAlive = conf.getBoolean("hbase.ipc.client.tcpkeepalive", true);
     this.pingInterval = getPingInterval(conf);
@@ -713,14 +740,14 @@ public class HBaseClient {
    */
   public Writable call(Writable param, InetSocketAddress address)
   throws IOException {
-      return call(param, address, null);
+      return call(param, address, null, 0);
   }
 
   public Writable call(Writable param, InetSocketAddress addr,
-                       UserGroupInformation ticket)
+                       UserGroupInformation ticket, int rpcTimeout)
                        throws IOException {
     Call call = new Call(param);
-    Connection connection = getConnection(addr, ticket, call);
+    Connection connection = getConnection(addr, ticket, rpcTimeout, call);
     connection.sendParam(call);                 // send the parameter
     boolean interrupted = false;
     //noinspection SynchronizationOnLocalVariableOrMethodParameter
@@ -803,7 +830,7 @@ public class HBaseClient {
       for (int i = 0; i < params.length; i++) {
         ParallelCall call = new ParallelCall(params[i], results, i);
         try {
-          Connection connection = getConnection(addresses[i], null, call);
+          Connection connection = getConnection(addresses[i], null, 0, call);
           connection.sendParam(call);             // send each parameter
         } catch (IOException e) {
           // log errors
@@ -826,6 +853,7 @@ public class HBaseClient {
    * pool.  Connections to a given host/port are reused. */
   private Connection getConnection(InetSocketAddress addr,
                                    UserGroupInformation ticket,
+                                   int rpcTimeout,
                                    Call call)
                                    throws IOException {
     if (!running.get()) {
@@ -837,7 +865,7 @@ public class HBaseClient {
      * connectionsId object and with set() method. We need to manage the
      * refs for keys in HashMap properly. For now its ok.
      */
-    ConnectionId remoteId = new ConnectionId(addr, ticket);
+    ConnectionId remoteId = new ConnectionId(addr, ticket, rpcTimeout);
     do {
       synchronized (connections) {
         connection = connections.get(remoteId);
@@ -863,10 +891,13 @@ public class HBaseClient {
   private static class ConnectionId {
     final InetSocketAddress address;
     final UserGroupInformation ticket;
+    final private int rpcTimeout;
 
-    ConnectionId(InetSocketAddress address, UserGroupInformation ticket) {
+    ConnectionId(InetSocketAddress address, UserGroupInformation ticket,
+        int rpcTimeout) {
       this.address = address;
       this.ticket = ticket;
+      this.rpcTimeout = rpcTimeout;
     }
 
     InetSocketAddress getAddress() {
@@ -880,7 +911,8 @@ public class HBaseClient {
     public boolean equals(Object obj) {
      if (obj instanceof ConnectionId) {
        ConnectionId id = (ConnectionId) obj;
-       return address.equals(id.address) && ticket == id.ticket;
+       return address.equals(id.address) && ticket == id.ticket && 
+       rpcTimeout == id.rpcTimeout;
        //Note : ticket is a ref comparision.
      }
      return false;
@@ -888,7 +920,7 @@ public class HBaseClient {
 
     @Override
     public int hashCode() {
-      return address.hashCode() ^ System.identityHashCode(ticket);
+      return address.hashCode() ^ System.identityHashCode(ticket) ^ rpcTimeout;
     }
   }
 }

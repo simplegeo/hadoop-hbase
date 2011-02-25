@@ -1,156 +1,45 @@
-commit 141178fbd79e618aff9dc8c328872d929a97bb01
-Author: Eli Collins <eli@cloudera.com>
-Date:   Mon Oct 25 21:01:42 2010 -0700
+commit fab7fb4175ce4095a8e14b08918d72c72d4cf2df
+Author: Jenkins <dev-kitchen@cloudera.com>
+Date:   Sat Feb 19 00:28:08 2011 -0800
 
-    CLOUDERA-BUILD. Add man page.
+    CLOUDERA-BUILD. Preparing for cdh3u0 development.
 
-commit 5e9777a0c3ce2f2c7a5bb172a4967a655b91d91e
-Author: Eli Collins <eli@cloudera.com>
-Date:   Mon Oct 11 09:43:26 2010 -0700
+commit 0140046cd7dd29d72ae372c047f974b48c8b4e32
+Author: Jenkins <dev-kitchen@cloudera.com>
+Date:   Sat Feb 19 00:27:52 2011 -0800
 
-    CLOUDERA-BUILD. Publish to Cloudera maven repo. Use Cloudera ZK.
+    CLOUDERA-BUILD. Preparing for CDH3B4 release.
 
-commit 80fd13dbb5d66bdfc80e6c22f6b4567f62499c49
+commit 86670a907d2957dfd0b4b0d96e47e5b26026ae76
 Author: Todd Lipcon <todd@cloudera.com>
-Date:   Sat Oct 9 17:56:08 2010 -0700
+Date:   Wed Jan 12 13:32:54 2011 -0800
 
-    CLOUDERA-BUILD. Fix versionless jar naming symlinks for multijar case
-    
-    Ref: CDH-2203
-
-commit baa476fc14c80e18e91ccd683c6aa045a6689fd3
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Sat Oct 9 17:36:53 2010 -0700
-
-    HBASE-3101. bin assembly should include tests and sources jar
-    
-    Author: Todd Lipcon
-    Reason: sqoop build depends on -tests jar
-    Ref: CDH-2203
-
-commit 1faa3e29bfc2935a71197fe28cec4dbecf2b7692
-Author: Eli Collins <eli@cloudera.com>
-Date:   Fri Oct 8 20:18:14 2010 -0700
-
-    CLOUDERA-BUILD. Update hadoop version.
-
-commit df24f2aa192153241a12711a95e861806db315f3
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Fri Oct 8 15:29:23 2010 -0700
-
-    HBASE-3096. TestCompaction timing out
+    HBASE-3533. Allow HBASE_LIBRARY_PATH to point to libs
     
     Author: Todd Lipcon
 
-commit c5361373f24d793ed11cf5935649b2d0bc920658
+commit d8fff4b8c5968c93a107266665a33bc725c2ee1c
 Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Oct 7 22:05:20 2010 -0700
+Date:   Mon Feb 14 18:31:10 2011 -0800
 
-    HBASE-2799. "Append not enabled" warning should not show if hbase root dir isn't on DFS
+    CLOUDERA-BUILD. Specify maven-source-plugin version as 2.1.2
     
-    Author: Michael Stack
+    Upstream this is inherited from the Apache parent pom, but the
+    Cloudera parent pom specifies an older version.
 
-commit 3190f7406c74c716fe09f693589314c67b98b62b
+commit 264145ec95990cf096a61208cdae95f648c904c1
+Author: Andrew Bayer <andrew.bayer@gmail.com>
+Date:   Tue Feb 1 18:01:57 2011 -0800
+
+    CLOUDERA-BUILD. CDH Mavenization.
+
+commit eff6e77cdd49771c3be5e68e15e842e0ce138f9f
 Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Oct 7 19:56:33 2010 -0700
+Date:   Thu Jan 27 19:45:50 2011 -0800
 
-    CLOUDERA-BUILD. cloudera directory should get installed
+    CLOUDERA-BUILD. Update pom.xml to CDH3b4 snapshot
 
-commit 62bec1e3c6a34bae54dbe05bf9c473ef401eb3fd
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Oct 7 18:34:43 2010 -0700
-
-    CLOUDERA-BUILD. Change wrapper scripts to not be dependent on setting a bunch of environment variables
-    
-    Fixes issues where /usr/lib/hbase/bin/hbase would fail, not finding the hadoop jars.
-
-commit 405eef0025bc6894c117b5d542706e18b64aa4fe
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Oct 7 13:29:27 2010 -0700
-
-    HBASE-3008  Memstore.updateColumnValue passes wrong flag to heapSizeChange (Causes memstore size to go negative)
-    
-    Author: Ryan Rawson
-
-commit 8acae9396f84c90c4b4513d4644fb30389c6847c
-Author: Todd Lipcon <todd@lipcon.org>
-Date:   Thu Sep 30 23:27:21 2010 -0700
-
-    Fix src assembly to make java libs 644, and not include hbase lib twice
-
-commit 427f35f2dc730c553d9be1c0d78d7b695e4b2b76
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Sep 30 22:50:02 2010 -0700
-
-    CLOUDERA-BUILD. Fix copy of bin/ to be cp -a
-
-commit 4c89df680a254d41fff96a4387280a8be505a2ad
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Sep 30 22:42:07 2010 -0700
-
-    CLOUDERA-BUILD. Build site as part of release build
-
-commit 49c5812eb3c58180b3a49791afc165d93d8351ea
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Tue Sep 28 22:59:55 2010 -0700
-
-    HBASE-2782. QoS for META table access
-    
-    Author: Ryan Rawson
-
-commit 74542880d740e9be24b103f1d5f5c6489d01911c
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Mon Aug 30 16:25:56 2010 -0700
-
-    CLOUDERA-BUILD. HBase running on secure hadoop, temporary patch.
-    
-    This is not upstreamed, since it currently is very difficult to do this
-    without reflection or a shim layer. This will be upstreamed with the
-    larger project of HBase security later this year.
-    
-    Author: Todd Lipcon
-
-commit 5476f351a90bd028de924ad021a7f0924b20e103
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Wed Sep 15 01:37:45 2010 -0400
-
-    HBASE-3001. TableMapReduceUtil should always add dependency jars
-    
-    Author: Todd Lipcon and Michael Stack
-
-commit 677ce02c0b4af1e361942e58bd8a34902cf363ca
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Wed Sep 15 01:37:37 2010 -0400
-
-    HBASE-3000. Add hbase classpath command
-
-commit 59af30dd33787024b7ee43375ea47bc2b3a06674
-Author: Todd Lipcon <todd@apache.org>
-Date:   Mon Sep 13 18:37:11 2010 +0000
-
-    HBASE-2980. Refactor region server command line to a new class
-    
-    Author: Todd Lipcon
-
-commit 313c7a888995509bfb6ad25251663d8281e6e124
-Author: Todd Lipcon <todd@apache.org>
-Date:   Fri Sep 10 05:48:39 2010 +0000
-
-    HBASE-2977. Refactor master command line to a new class
-
-commit 6647194e4e48aba590a9fba9d3c699ee05510b16
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Wed Sep 8 13:45:41 2010 -0700
-
-    SequenceFileLogWriter doesn't need to actually call sync()
-
-commit cec5868f8de0080107540234f3005f1f033d43a4
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Tue Sep 7 21:41:25 2010 -0700
-
-    HBASE-2467. Concurrent flushers in HLog sync using HDFS-895 (JD's v3 patch)
-
-commit cdeff4c4e3e5c21b55b04cd36c17804f88eba88e
+commit 5e4420bddcea5593f62c5b5ec07ca829a59ab3ba
 Author: todd <todd@ubuntu64-build01.(none)>
 Date:   Sun Jun 27 23:24:58 2010 -0700
 
@@ -160,55 +49,16 @@ Date:   Sun Jun 27 23:24:58 2010 -0700
     
     CLOUDERA-BUILD. Replace rsync with cp.
 
-commit e9c356f37bf195fc284e51ecd93c40b2a0b38509
+commit 0f84f735501b02d3467f4a6c8f2d617bff6e6ce4
 Author: todd <todd@ubuntu64-build01.(none)>
 Date:   Sun Jun 27 22:21:29 2010 -0700
 
     CLOUDERA-BUILD. hbase-config.sh should set HBASE_PID_DIR if unset
 
-commit cf4dc092807fc922103366ed222bef2745320a84
-Author: todd <todd@ubuntu64-build01.(none)>
-Date:   Sun Jun 27 21:52:18 2010 -0700
-
-    CLOUDERA-BUILD. Include cloudera/ dir in src assembly
-
-commit 89b8bdcb7eb2837c07a03783f2065be9f69a478d
-Author: Todd Lipcon <todd@lipcon.org>
-Date:   Sun Jun 20 20:25:13 2010 -0700
-
-    HBASE-2773. Check for null values in meta in test util
-
-commit 4377d51ef77152d798c7c7739a6e64c52911286c
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Thu Jun 3 20:32:45 2010 -0700
-
-    Re-enable log split test
-
-commit 5457635b3f41be41bd2172b5beeb9ec8ba448a01
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Mon May 17 17:54:16 2010 -0700
-
-    Add VerifiableEditor
-
-commit 5ac1ffdf37c28be48196eb0f4226e0ade6d3e048
-Author: Todd Lipcon <todd@cloudera.com>
-Date:   Mon May 17 17:22:34 2010 -0700
-
-    CLOUDERA-BUILD. Switch to CDH3b3 snapshot in todd's repo
-
-commit b569811d0a92da0011375e27d2b38dc04cef3c44
+commit dd7467739d6ea0a0c61ce127ea3ea1280a88f147
 Author: newalex <newalex@ubuntu64-build01.(none)>
 Date:   Tue Jun 22 12:26:19 2010 -0700
 
     CLOUDERA-BUILD. Add build infrastructure.
     
     CLOUDERA-BUILD. Build should create a "mixed" src/bin tarball, and install from that
-
-commit 692785c890809f1475229a398cc1dba501d6cab9
-Author: Jean-Daniel Cryans <jdcryans@apache.org>
-Date:   Tue Oct 5 19:05:51 2010 +0000
-
-    Updating the site for 0.89.20100924
-    
-    
-    git-svn-id: https://svn.apache.org/repos/asf/hbase/tags/0.89.20100924RC1@1004768 13f79535-47bb-0310-9956-ffa450edef68

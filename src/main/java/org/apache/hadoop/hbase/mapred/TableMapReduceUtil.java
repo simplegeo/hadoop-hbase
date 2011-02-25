@@ -56,6 +56,26 @@ public class TableMapReduceUtil {
     Class<? extends TableMap> mapper,
     Class<? extends WritableComparable> outputKeyClass,
     Class<? extends Writable> outputValueClass, JobConf job) {
+    initTableMapJob(table, columns, mapper, outputKeyClass, outputValueClass, job, true);
+  }
+
+  /**
+   * Use this before submitting a TableMap job. It will
+   * appropriately set up the JobConf.
+   *
+   * @param table  The table name to read from.
+   * @param columns  The columns to scan.
+   * @param mapper  The mapper class to use.
+   * @param outputKeyClass  The class of the output key.
+   * @param outputValueClass  The class of the output value.
+   * @param job  The current job configuration to adjust.
+   * @param addDependencyJars upload HBase jars and jars for any of the configured
+   *           job classes via the distributed cache (tmpjars).
+   */
+  public static void initTableMapJob(String table, String columns,
+    Class<? extends TableMap> mapper,
+    Class<? extends WritableComparable> outputKeyClass,
+    Class<? extends Writable> outputValueClass, JobConf job, boolean addDependencyJars) {
 
     job.setInputFormat(TableInputFormat.class);
     job.setMapOutputValueClass(outputValueClass);
@@ -63,10 +83,12 @@ public class TableMapReduceUtil {
     job.setMapperClass(mapper);
     FileInputFormat.addInputPaths(job, table);
     job.set(TableInputFormat.COLUMN_LIST, columns);
-    try {
-      addDependencyJars(job);
-    } catch (IOException ioe) {
-      throw new RuntimeException(ioe);
+    if (addDependencyJars) {
+      try {
+        addDependencyJars(job);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
     }
   }
 
@@ -99,6 +121,25 @@ public class TableMapReduceUtil {
   public static void initTableReduceJob(String table,
     Class<? extends TableReduce> reducer, JobConf job, Class partitioner)
   throws IOException {
+    initTableReduceJob(table, reducer, job, partitioner, true);
+  }
+
+  /**
+   * Use this before submitting a TableReduce job. It will
+   * appropriately set up the JobConf.
+   *
+   * @param table  The output table.
+   * @param reducer  The reducer class to use.
+   * @param job  The current job configuration to adjust.
+   * @param partitioner  Partitioner to use. Pass <code>null</code> to use
+   * default partitioner.
+   * @param addDependencyJars upload HBase jars and jars for any of the configured
+   *           job classes via the distributed cache (tmpjars).
+   * @throws IOException When determining the region count fails.
+   */
+  public static void initTableReduceJob(String table,
+    Class<? extends TableReduce> reducer, JobConf job, Class partitioner,
+    boolean addDependencyJars) throws IOException {
     job.setOutputFormat(TableOutputFormat.class);
     job.setReducerClass(reducer);
     job.set(TableOutputFormat.OUTPUT_TABLE, table);
@@ -106,7 +147,7 @@ public class TableMapReduceUtil {
     job.setOutputValueClass(Put.class);
     if (partitioner == HRegionPartitioner.class) {
       job.setPartitionerClass(HRegionPartitioner.class);
-      HTable outputTable = new HTable(new HBaseConfiguration(job), table);
+      HTable outputTable = new HTable(HBaseConfiguration.create(job), table);
       int regions = outputTable.getRegionsInfo().size();
       if (job.getNumReduceTasks() > regions) {
         job.setNumReduceTasks(outputTable.getRegionsInfo().size());
@@ -114,7 +155,9 @@ public class TableMapReduceUtil {
     } else if (partitioner != null) {
       job.setPartitionerClass(partitioner);
     }
-    addDependencyJars(job);
+    if (addDependencyJars) {
+      addDependencyJars(job);
+    }
   }
 
   /**
@@ -127,7 +170,7 @@ public class TableMapReduceUtil {
    */
   public static void limitNumReduceTasks(String table, JobConf job)
   throws IOException {
-    HTable outputTable = new HTable(new HBaseConfiguration(job), table);
+    HTable outputTable = new HTable(HBaseConfiguration.create(job), table);
     int regions = outputTable.getRegionsInfo().size();
     if (job.getNumReduceTasks() > regions)
       job.setNumReduceTasks(regions);
@@ -143,7 +186,7 @@ public class TableMapReduceUtil {
    */
   public static void limitNumMapTasks(String table, JobConf job)
   throws IOException {
-    HTable outputTable = new HTable(new HBaseConfiguration(job), table);
+    HTable outputTable = new HTable(HBaseConfiguration.create(job), table);
     int regions = outputTable.getRegionsInfo().size();
     if (job.getNumMapTasks() > regions)
       job.setNumMapTasks(regions);
@@ -159,7 +202,7 @@ public class TableMapReduceUtil {
    */
   public static void setNumReduceTasks(String table, JobConf job)
   throws IOException {
-    HTable outputTable = new HTable(new HBaseConfiguration(job), table);
+    HTable outputTable = new HTable(HBaseConfiguration.create(job), table);
     int regions = outputTable.getRegionsInfo().size();
     job.setNumReduceTasks(regions);
   }
@@ -174,7 +217,7 @@ public class TableMapReduceUtil {
    */
   public static void setNumMapTasks(String table, JobConf job)
   throws IOException {
-    HTable outputTable = new HTable(new HBaseConfiguration(job), table);
+    HTable outputTable = new HTable(HBaseConfiguration.create(job), table);
     int regions = outputTable.getRegionsInfo().size();
     job.setNumMapTasks(regions);
   }

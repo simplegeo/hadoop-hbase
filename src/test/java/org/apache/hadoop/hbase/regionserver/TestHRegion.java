@@ -19,9 +19,22 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestCase;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
@@ -49,27 +62,16 @@ import org.apache.hadoop.hbase.filter.SingleColumnValueFilter;
 import org.apache.hadoop.hbase.regionserver.HRegion.RegionScanner;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.EnvironmentEdge;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManagerTestHelper;
-import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.IncrementingEnvironmentEdge;
 import org.apache.hadoop.hbase.util.ManualEnvironmentEdge;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.PairOfSameType;
 import org.apache.hadoop.hbase.util.Threads;
 
-import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 
 /**
@@ -95,6 +97,8 @@ public class TestHRegion extends HBaseTestCase {
   protected final byte[] value1 = Bytes.toBytes("value1");
   protected final byte[] value2 = Bytes.toBytes("value2");
   protected final byte [] row = Bytes.toBytes("rowA");
+  protected final byte [] row2 = Bytes.toBytes("rowB");
+
 
   /**
    * @see org.apache.hadoop.hbase.HBaseTestCase#setUp()
@@ -117,7 +121,7 @@ public class TestHRegion extends HBaseTestCase {
   //////////////////////////////////////////////////////////////////////////////
 
   public void testGetWhileRegionClose() throws IOException {
-    HBaseConfiguration hc = initSplit();
+    Configuration hc = initSplit();
     int numRows = 100;
     byte [][] families = {fam1, fam2, fam3};
 
@@ -602,6 +606,20 @@ public class TestHRegion extends HBaseTestCase {
       assertEquals(expected[i], actual[i]);
     }
 
+  }
+
+  public void testCheckAndPut_wrongRowInPut() throws IOException {
+    initHRegion(tableName, this.getName(), COLUMNS);
+
+    Put put = new Put(row2);
+    put.add(fam1, qual1, value1);
+    try {
+    boolean res = region.checkAndMutate(row,
+        fam1, qual1, value2, put, null, false);
+      fail();
+    } catch (DoNotRetryIOException expected) {
+      // expected exception.
+    }
   }
 
   public void testCheckAndDelete_ThatDeleteWasWritten() throws IOException{
@@ -1194,7 +1212,7 @@ public class TestHRegion extends HBaseTestCase {
     byte [] tableName = Bytes.toBytes("testtable");
     byte [][] families = {fam1, fam2, fam3};
 
-    HBaseConfiguration hc = initSplit();
+    Configuration hc = initSplit();
     //Setting up region
     String method = this.getName();
     initHRegion(tableName, method, hc, families);
@@ -1257,7 +1275,7 @@ public class TestHRegion extends HBaseTestCase {
   public void testMerge() throws IOException {
     byte [] tableName = Bytes.toBytes("testtable");
     byte [][] families = {fam1, fam2, fam3};
-    HBaseConfiguration hc = initSplit();
+    Configuration hc = initSplit();
     //Setting up region
     String method = this.getName();
     initHRegion(tableName, method, hc, families);
@@ -1316,7 +1334,7 @@ public class TestHRegion extends HBaseTestCase {
     // the prepare call -- we are not ready to split just now.  Just return.
     if (!st.prepare()) return null;
     try {
-      result = st.execute(null);
+      result = st.execute(null, null);
     } catch (IOException ioe) {
       try {
         LOG.info("Running rollback of failed split of " +
@@ -2067,6 +2085,59 @@ public class TestHRegion extends HBaseTestCase {
     assertICV(row, fam1, qual3, amount);
   }
 
+  /**
+   * Added for HBASE-3235.
+   *
+   * When the initial put and an ICV update were arriving with the same timestamp,
+   * the initial Put KV was being skipped during {@link MemStore#upsert(KeyValue)}
+   * causing the iteration for matching KVs, causing the update-in-place to not
+   * happen and the ICV put to effectively disappear.
+   * @throws IOException
+   */
+  public void testIncrementColumnValue_UpdatingInPlace_TimestampClobber() throws IOException {
+    initHRegion(tableName, getName(), fam1);
+
+    long value = 1L;
+    long amount = 3L;
+    long now = EnvironmentEdgeManager.currentTimeMillis();
+    ManualEnvironmentEdge mock = new ManualEnvironmentEdge();
+    mock.setValue(now);
+    EnvironmentEdgeManagerTestHelper.injectEdge(mock);
+
+    // verify we catch an ICV on a put with the same timestamp
+    Put put = new Put(row);
+    put.add(fam1, qual1, now, Bytes.toBytes(value));
+    region.put(put);
+
+    long result = region.incrementColumnValue(row, fam1, qual1, amount, true);
+
+    assertEquals(value+amount, result);
+
+    Store store = region.getStore(fam1);
+    // ICV should update the existing Put with the same timestamp
+    assertEquals(1, store.memstore.kvset.size());
+    assertTrue(store.memstore.snapshot.isEmpty());
+
+    assertICV(row, fam1, qual1, value+amount);
+
+    // verify we catch an ICV even when the put ts > now
+    put = new Put(row);
+    put.add(fam1, qual2, now+1, Bytes.toBytes(value));
+    region.put(put);
+
+    result = region.incrementColumnValue(row, fam1, qual2, amount, true);
+
+    assertEquals(value+amount, result);
+
+    store = region.getStore(fam1);
+    // ICV should update the existing Put with the same timestamp
+    assertEquals(2, store.memstore.kvset.size());
+    assertTrue(store.memstore.snapshot.isEmpty());
+
+    assertICV(row, fam1, qual2, value+amount);
+    EnvironmentEdgeManagerTestHelper.reset();
+  }
+
   private void assertICV(byte [] row,
                          byte [] familiy,
                          byte[] qualifier,
@@ -2171,7 +2242,7 @@ public class TestHRegion extends HBaseTestCase {
     byte [] tableName = Bytes.toBytes("testtable");
     byte [][] families = {fam1, fam2, fam3};
 
-    HBaseConfiguration hc = initSplit();
+    Configuration hc = initSplit();
     //Setting up region
     String method = this.getName();
     initHRegion(tableName, method, hc, families);
@@ -2258,7 +2329,7 @@ public class TestHRegion extends HBaseTestCase {
   public void testSplitRegion() throws IOException {
     byte [] tableName = Bytes.toBytes("testtable");
     byte [] qualifier = Bytes.toBytes("qualifier");
-    HBaseConfiguration hc = initSplit();
+    Configuration hc = initSplit();
     int numRows = 10;
     byte [][] families = {fam1, fam3};
 
@@ -2663,7 +2734,7 @@ public class TestHRegion extends HBaseTestCase {
 
     //Setting up region
     String method = "testIndexesScanWithOneDeletedRow";
-    initHRegion(tableName, method, new HBaseConfiguration(), family);
+    initHRegion(tableName, method, HBaseConfiguration.create(), family);
 
     Put put = new Put(Bytes.toBytes(1L));
     put.add(family, qual1, 1L, Bytes.toBytes(1L));
@@ -2867,8 +2938,8 @@ public class TestHRegion extends HBaseTestCase {
     }
   }
 
-  private HBaseConfiguration initSplit() {
-    HBaseConfiguration conf = new HBaseConfiguration();
+  private Configuration initSplit() {
+    Configuration conf = HBaseConfiguration.create();
     // Always compact if there is more than one store file.
     conf.setInt("hbase.hstore.compactionThreshold", 2);
 
@@ -2889,11 +2960,11 @@ public class TestHRegion extends HBaseTestCase {
   private void initHRegion (byte [] tableName, String callingMethod,
     byte[] ... families)
   throws IOException {
-    initHRegion(tableName, callingMethod, new HBaseConfiguration(), families);
+    initHRegion(tableName, callingMethod, HBaseConfiguration.create(), families);
   }
 
   private void initHRegion (byte [] tableName, String callingMethod,
-    HBaseConfiguration conf, byte [] ... families)
+    Configuration conf, byte [] ... families)
   throws IOException{
     HTableDescriptor htd = new HTableDescriptor(tableName);
     for(byte [] family : families) {

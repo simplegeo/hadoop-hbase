@@ -19,21 +19,28 @@
  */
 package org.apache.hadoop.hbase.ipc;
 
+import java.io.IOException;
+import java.net.ConnectException;
+import java.util.List;
+import java.util.NavigableSet;
+
+import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HServerInfo;
 import org.apache.hadoop.hbase.NotServingRegionException;
+import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
+import org.apache.hadoop.hbase.client.Increment;
+import org.apache.hadoop.hbase.client.MultiAction;
 import org.apache.hadoop.hbase.client.MultiPut;
 import org.apache.hadoop.hbase.client.MultiPutResponse;
+import org.apache.hadoop.hbase.client.MultiResponse;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
-import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
-
-import java.io.IOException;
-import java.util.List;
+import org.apache.hadoop.ipc.RemoteException;
 
 /**
  * Clients interact with HRegionServers using a handle to the HRegionInterface.
@@ -41,17 +48,18 @@ import java.util.List;
  * <p>NOTE: if you change the interface, you must change the RPC version
  * number in HBaseRPCProtocolVersion
  */
-public interface HRegionInterface extends HBaseRPCProtocolVersion {
+public interface HRegionInterface extends HBaseRPCProtocolVersion, Stoppable, Abortable {
   /**
    * Get metainfo about an HRegion
    *
    * @param regionName name of the region
    * @return HRegionInfo object for region
-   * @throws NotServingRegionException e
+   * @throws NotServingRegionException
+   * @throws ConnectException
+   * @throws IOException This can manifest as an Hadoop ipc {@link RemoteException}
    */
   public HRegionInfo getRegionInfo(final byte [] regionName)
-  throws NotServingRegionException;
-
+  throws NotServingRegionException, ConnectException, IOException;
 
   /**
    * Return all the data for the row that matches <i>row</i> exactly,
@@ -66,12 +74,6 @@ public interface HRegionInterface extends HBaseRPCProtocolVersion {
   public Result getClosestRowBefore(final byte [] regionName,
     final byte [] row, final byte [] family)
   throws IOException;
-
-  /**
-   *
-   * @return the regions served by this regionserver
-   */
-  public HRegion [] getOnlineRegionsAsArray();
 
   /**
    * Perform Get operation.
@@ -192,6 +194,18 @@ public interface HRegionInterface extends HBaseRPCProtocolVersion {
       byte [] family, byte [] qualifier, long amount, boolean writeToWAL)
   throws IOException;
 
+  /**
+   * Increments one or more columns values in a row.  Returns the
+   * updated keys after the increment.
+   * <p>
+   * This operation does not appear atomic to readers.  Increments are done
+   * under a row lock but readers do not take row locks.
+   * @param regionName region name
+   * @param increment increment operation
+   * @return incremented cells
+   */
+  public Result increment(byte[] regionName, Increment increment)
+  throws IOException;
 
   //
   // remote scanner interface
@@ -258,11 +272,10 @@ public interface HRegionInterface extends HBaseRPCProtocolVersion {
 
 
   /**
-   * Method used when a master is taking the place of another failed one.
-   * @return All regions assigned on this region server
+   * @return All regions online on this region server
    * @throws IOException e
    */
-  public HRegionInfo[] getRegionsAssignment() throws IOException;
+  public List<HRegionInfo> getOnlineRegions();
 
   /**
    * Method used when a master is taking the place of another failed one.
@@ -271,6 +284,13 @@ public interface HRegionInterface extends HBaseRPCProtocolVersion {
    */
   public HServerInfo getHServerInfo() throws IOException;
 
+  /**
+   * Method used for doing multiple actions(Deletes, Gets and Puts) in one call
+   * @param multi
+   * @return MultiResult
+   * @throws IOException
+   */
+  public MultiResponse multi(MultiAction multi) throws IOException;
 
   /**
    * Multi put for putting multiple regions worth of puts at once.
@@ -284,8 +304,82 @@ public interface HRegionInterface extends HBaseRPCProtocolVersion {
   /**
    * Bulk load an HFile into an open region
    */
-  public void bulkLoadHFile(String hfilePath,
-      byte[] regionName, byte[] familyName) throws IOException;
+  public void bulkLoadHFile(String hfilePath, byte[] regionName, byte[] familyName)
+  throws IOException;
+
+  // Master methods
+
+  /**
+   * Opens the specified region.
+   * @param region region to open
+   * @throws IOException
+   */
+  public void openRegion(final HRegionInfo region) throws IOException;
+
+  /**
+   * Opens the specified regions.
+   * @param regions regions to open
+   * @throws IOException
+   */
+  public void openRegions(final List<HRegionInfo> regions) throws IOException;
+
+  /**
+   * Closes the specified region.
+   * @param region region to close
+   * @return true if closing region, false if not
+   * @throws IOException
+   */
+  public boolean closeRegion(final HRegionInfo region)
+  throws IOException;
+
+  /**
+   * Closes the specified region and will use or not use ZK during the close
+   * according to the specified flag.
+   * @param region region to close
+   * @param zk true if transitions should be done in ZK, false if not
+   * @return true if closing region, false if not
+   * @throws IOException
+   */
+  public boolean closeRegion(final HRegionInfo region, final boolean zk)
+  throws IOException;
+
+  // Region administrative methods
+
+  /**
+   * Flushes the MemStore of the specified region.
+   * <p>
+   * This method is synchronous.
+   * @param regionInfo region to flush
+   * @throws NotServingRegionException
+   * @throws IOException
+   */
+  void flushRegion(HRegionInfo regionInfo)
+  throws NotServingRegionException, IOException;
+
+  /**
+   * Splits the specified region.
+   * <p>
+   * This method currently flushes the region and then forces a compaction which
+   * will then trigger a split.  The flush is done synchronously but the
+   * compaction is asynchronous.
+   * @param regionInfo region to split
+   * @throws NotServingRegionException
+   * @throws IOException
+   */
+  void splitRegion(HRegionInfo regionInfo)
+  throws NotServingRegionException, IOException;
+
+  /**
+   * Compacts the specified region.  Performs a major compaction if specified.
+   * <p>
+   * This method is asynchronous.
+   * @param regionInfo region to compact
+   * @param major true to force major compaction
+   * @throws NotServingRegionException
+   * @throws IOException
+   */
+  void compactRegion(HRegionInfo regionInfo, boolean major)
+  throws NotServingRegionException, IOException;
 
   /**
    * Replicates the given entries. The guarantee is that the given entries
@@ -297,5 +391,4 @@ public interface HRegionInterface extends HBaseRPCProtocolVersion {
    * @throws IOException
    */
   public void replicateLogEntries(HLog.Entry[] entries) throws IOException;
-
 }
