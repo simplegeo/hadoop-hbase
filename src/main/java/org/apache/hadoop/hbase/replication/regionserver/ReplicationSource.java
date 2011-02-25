@@ -19,25 +19,6 @@
  */
 package org.apache.hadoop.hbase.replication.regionserver;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.HServerAddress;
-import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.client.HConnection;
-import org.apache.hadoop.hbase.client.HConnectionManager;
-import org.apache.hadoop.hbase.ipc.HRegionInterface;
-import org.apache.hadoop.hbase.regionserver.wal.HLog;
-import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
-import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
-import org.apache.hadoop.hbase.replication.ReplicationZookeeperWrapper;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.util.Threads;
-
 import java.io.EOFException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -53,6 +34,27 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HServerAddress;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.Stoppable;
+import org.apache.hadoop.hbase.client.HConnection;
+import org.apache.hadoop.hbase.client.HConnectionManager;
+import org.apache.hadoop.hbase.ipc.HRegionInterface;
+import org.apache.hadoop.hbase.regionserver.wal.HLog;
+import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
+import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.replication.ReplicationZookeeper;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Threads;
+import org.apache.zookeeper.KeeperException;
 
 /**
  * Class that handles the source of a replication stream.
@@ -76,7 +78,7 @@ public class ReplicationSource extends Thread
   private HLog.Entry[] entriesArray;
   private HConnection conn;
   // Helper class for zookeeper
-  private ReplicationZookeeperWrapper zkHelper;
+  private ReplicationZookeeper zkHelper;
   private Configuration conf;
   // ratio of region servers to chose from a slave cluster
   private float ratio;
@@ -88,7 +90,7 @@ public class ReplicationSource extends Thread
   // The manager of all sources to which we ping back our progress
   private ReplicationSourceManager manager;
   // Should we stop everything?
-  private AtomicBoolean stop;
+  private Stoppable stopper;
   // List of chosen sinks (region servers)
   private List<HServerAddress> currentPeers;
   // How long should we sleep for each retry
@@ -124,6 +126,9 @@ public class ReplicationSource extends Thread
   private volatile boolean running = true;
   // Metrics for this source
   private ReplicationSourceMetrics metrics;
+  // If source is enabled, replication happens. If disabled, nothing will be
+  // replicated but HLogs will still be queued
+  private AtomicBoolean sourceEnabled = new AtomicBoolean();
 
   /**
    * Instantiation method used by region servers
@@ -139,11 +144,11 @@ public class ReplicationSource extends Thread
   public void init(final Configuration conf,
                    final FileSystem fs,
                    final ReplicationSourceManager manager,
-                   final AtomicBoolean stopper,
+                   final Stoppable stopper,
                    final AtomicBoolean replicating,
                    final String peerClusterZnode)
       throws IOException {
-    this.stop = stopper;
+    this.stopper = stopper;
     this.conf = conf;
     this.replicationQueueSizeCapacity =
         this.conf.getLong("replication.source.size.capacity", 1024*1024*64);
@@ -194,10 +199,10 @@ public class ReplicationSource extends Thread
   /**
    * Select a number of peers at random using the ratio. Mininum 1.
    */
-  private void chooseSinks() {
+  private void chooseSinks() throws KeeperException {
     this.currentPeers.clear();
     List<HServerAddress> addresses =
-        this.zkHelper.getPeersAddresses(peerClusterId);
+        this.zkHelper.getSlavesAddresses(peerClusterId);
     Set<HServerAddress> setOfAddr = new HashSet<HServerAddress>();
     int nbPeers = (int) (Math.ceil(addresses.size() * ratio));
     LOG.info("Getting " + nbPeers +
@@ -224,18 +229,30 @@ public class ReplicationSource extends Thread
   public void run() {
     connectToPeers();
     // We were stopped while looping to connect to sinks, just abort
-    if (this.stop.get()) {
+    if (this.stopper.isStopped()) {
       return;
     }
     // If this is recovered, the queue is already full and the first log
     // normally has a position (unless the RS failed between 2 logs)
     if (this.queueRecovered) {
-      this.position = this.zkHelper.getHLogRepPosition(
-          this.peerClusterZnode, this.queue.peek().getName());
+      try {
+        this.position = this.zkHelper.getHLogRepPosition(
+            this.peerClusterZnode, this.queue.peek().getName());
+      } catch (KeeperException e) {
+        this.terminate("Couldn't get the position of this recovered queue " +
+            peerClusterZnode, e);
+      }
     }
     int sleepMultiplier = 1;
     // Loop until we close down
-    while (!stop.get() && this.running) {
+    while (!stopper.isStopped() && this.running) {
+      // Sleep until replication is enabled again
+      if (!this.replicating.get() || !this.sourceEnabled.get()) {
+        if (sleepForRetries("Replication is disabled", sleepMultiplier)) {
+          sleepMultiplier++;
+        }
+        continue;
+      }
       // Get a new path
       if (!getNextPath()) {
         if (sleepForRetries("No log to process", sleepMultiplier)) {
@@ -311,7 +328,9 @@ public class ReplicationSource extends Thread
       // If we didn't get anything to replicate, or if we hit a IOE,
       // wait a bit and retry.
       // But if we need to stop, don't bother sleeping
-      if (!stop.get() && (gotIOE || currentNbEntries == 0)) {
+      if (!stopper.isStopped() && (gotIOE || currentNbEntries == 0)) {
+        this.manager.logPositionAndCleanOldLogs(this.currentPath,
+            this.peerClusterZnode, this.position, queueRecovered);
         if (sleepForRetries("Nothing to replicate", sleepMultiplier)) {
           sleepMultiplier++;
         }
@@ -373,12 +392,14 @@ public class ReplicationSource extends Thread
 
   private void connectToPeers() {
     // Connect to peer cluster first, unless we have to stop
-    while (!this.stop.get() && this.currentPeers.size() == 0) {
+    while (!this.stopper.isStopped() && this.currentPeers.size() == 0) {
       try {
         chooseSinks();
         Thread.sleep(this.sleepForRetries);
       } catch (InterruptedException e) {
         LOG.error("Interrupted while trying to connect to sinks", e);
+      } catch (KeeperException e) {
+        LOG.error("Error talking to zookeeper, retrying", e);
       }
     }
   }
@@ -407,7 +428,7 @@ public class ReplicationSource extends Thread
    */
   protected boolean openReader(int sleepMultiplier) {
     try {
-      LOG.info("Opening log for replication " + this.currentPath.getName() +
+      LOG.debug("Opening log for replication " + this.currentPath.getName() +
           " at " + this.position);
       try {
        this.reader = null;
@@ -417,22 +438,31 @@ public class ReplicationSource extends Thread
           // We didn't find the log in the archive directory, look if it still
           // exists in the dead RS folder (there could be a chain of failures
           // to look at)
-          for (int i = this.deadRegionServers.length - 1; i > 0; i--) {
+          LOG.info("NB dead servers : " + deadRegionServers.length);
+          for (int i = this.deadRegionServers.length - 1; i >= 0; i--) {
+
             Path deadRsDirectory =
-                new Path(this.manager.getLogDir(), this.deadRegionServers[i]);
+                new Path(manager.getLogDir().getParent(), this.deadRegionServers[i]);
             Path possibleLogLocation =
                 new Path(deadRsDirectory, currentPath.getName());
+            LOG.info("Possible location " + possibleLogLocation.toUri().toString());
             if (this.manager.getFs().exists(possibleLogLocation)) {
               // We found the right new location
               LOG.info("Log " + this.currentPath + " still exists at " +
                   possibleLogLocation);
               // Breaking here will make us sleep since reader is null
-              break;
+              return true;
             }
           }
           // TODO What happens if the log was missing from every single location?
           // Although we need to check a couple of times as the log could have
           // been moved by the master between the checks
+          // It can also happen if a recovered queue wasn't properly cleaned,
+          // such that the znode pointing to a log exists but the log was
+          // deleted a long time ago.
+          // For the moment, we'll throw the IO and processEndOfFile
+          throw new IOException("File from recovered queue is " +
+              "nowhere to be found", fnfe);
         } else {
           // If the log was archived, continue reading from there
           Path archivedLogLocation =
@@ -464,7 +494,7 @@ public class ReplicationSource extends Thread
    * Do the sleeping logic
    * @param msg Why we sleep
    * @param sleepMultiplier by how many times the default sleeping time is augmented
-   * @return
+   * @return True if <code>sleepMultiplier</code> is &lt; <code>maxRetriesMultiplier</code>
    */
   protected boolean sleepForRetries(String msg, int sleepMultiplier) {
     try {
@@ -517,7 +547,11 @@ public class ReplicationSource extends Thread
    */
   protected void shipEdits() {
     int sleepMultiplier = 1;
-    while (!stop.get()) {
+    if (this.currentNbEntries == 0) {
+      LOG.warn("Was given 0 edits to ship");
+      return;
+    }
+    while (!this.stopper.isStopped()) {
       try {
         HRegionInterface rrs = getRS();
         LOG.debug("Replicating " + currentNbEntries);
@@ -549,9 +583,11 @@ public class ReplicationSource extends Thread
                 chooseSinks();
               }
             }
-          } while (!stop.get() && down);
+          } while (!this.stopper.isStopped() && down);
         } catch (InterruptedException e) {
           LOG.debug("Interrupted while trying to contact the peer cluster");
+        } catch (KeeperException e) {
+          LOG.error("Error talking to zookeeper, retrying", e);
         }
 
       }
@@ -572,7 +608,8 @@ public class ReplicationSource extends Thread
       return true;
     } else if (this.queueRecovered) {
       this.manager.closeRecoveredQueue(this);
-      this.abort();
+      LOG.info("Finished recovering the queue");
+      this.running = false;
       return true;
     }
     return false;
@@ -583,25 +620,27 @@ public class ReplicationSource extends Thread
     Thread.UncaughtExceptionHandler handler =
         new Thread.UncaughtExceptionHandler() {
           public void uncaughtException(final Thread t, final Throwable e) {
-            LOG.fatal("Set stop flag in " + t.getName(), e);
-            abort();
+            terminate("Uncaught exception during runtime", new Exception(e));
           }
         };
     Threads.setDaemonThreadRunning(
-        this, n + ".replicationSource," + clusterId, handler);
+        this, n + ".replicationSource," + peerClusterZnode, handler);
   }
 
-  /**
-   * Hastily stop the replication, then wait for shutdown
-   */
-  private void abort() {
-    LOG.info("abort");
+  public void terminate(String reason) {
+    terminate(reason, null);
+  }
+
+  public void terminate(String reason, Exception cause) {
+    if (cause == null) {
+      LOG.info("Closing source "
+          + this.peerClusterZnode + " because: " + reason);
+
+    } else {
+      LOG.error("Closing source " + this.peerClusterZnode
+          + " because an error occurred: " + reason, cause);
+    }
     this.running = false;
-    terminate();
-  }
-
-  public void terminate() {
-    LOG.info("terminate");
     Threads.shutdown(this, this.sleepForRetries);
   }
 
@@ -645,21 +684,20 @@ public class ReplicationSource extends Thread
     return down;
   }
 
-  /**
-   * Get the id that the source is replicating to
-   *
-   * @return peer cluster id
-   */
   public String getPeerClusterZnode() {
     return this.peerClusterZnode;
   }
 
-  /**
-   * Get the path of the current HLog
-   * @return current hlog's path
-   */
+  public String getPeerClusterId() {
+    return this.peerClusterId;
+  }
+
   public Path getCurrentPath() {
     return this.currentPath;
+  }
+
+  public void setSourceEnabled(boolean status) {
+    this.sourceEnabled.set(status);
   }
 
   /**
@@ -688,5 +726,4 @@ public class ReplicationSource extends Thread
       return Long.parseLong(parts[parts.length-1]);
     }
   }
-
 }

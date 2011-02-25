@@ -20,18 +20,6 @@
 
 package org.apache.hadoop.hbase.ipc;
 
-import com.google.common.base.Function;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.io.ObjectWritable;
-import org.apache.hadoop.io.Writable;
-import org.apache.hadoop.io.WritableUtils;
-import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.util.ReflectionUtils;
-import org.apache.hadoop.util.StringUtils;
-
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -63,7 +51,21 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.security.PrivilegedExceptionAction;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.io.WritableWithSize;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.io.ObjectWritable;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.WritableUtils;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.util.StringUtils;
+
+import com.google.common.base.Function;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /** An abstract IPC service.  IPC calls take a single {@link Writable} as a
  * parameter, and return a {@link Writable} as their value.  A service runs on
@@ -90,11 +92,20 @@ public abstract class HBaseServer {
    */
   private static final int MAX_QUEUE_SIZE_PER_HANDLER = 100;
 
+  private static final String WARN_RESPONSE_SIZE =
+      "hbase.ipc.warn.response.size";
+
+  /** Default value for above param */
+  private static final int DEFAULT_WARN_RESPONSE_SIZE = 100 * 1024 * 1024;
+
+  private final int warnResponseSize;
+
   public static final Log LOG =
     LogFactory.getLog("org.apache.hadoop.ipc.HBaseServer");
 
   protected static final ThreadLocal<HBaseServer> SERVER =
     new ThreadLocal<HBaseServer>();
+  private volatile boolean started = false;
 
   /** Returns the server instance called under or null.  May be called under
    * {@link #call(Writable, long)} implementations, and under {@link Writable}
@@ -152,7 +163,6 @@ public abstract class HBaseServer {
 
   protected Configuration conf;
 
-  @SuppressWarnings({"FieldCanBeLocal"})
   private int maxQueueSize;
   protected int socketSendBufferSize;
   protected final boolean tcpNoDelay;   // if T then disable Nagle's Algorithm
@@ -263,7 +273,9 @@ public abstract class HBaseServer {
       selector= Selector.open();
 
       readers = new Reader[readThreads];
-      readPool = Executors.newFixedThreadPool(readThreads);
+      readPool = Executors.newFixedThreadPool(readThreads,
+        new ThreadFactoryBuilder().setNameFormat(
+          "IPC Reader %d on port " + port).build());
       for (int i = 0; i < readThreads; ++i) {
         Selector readSelector = Selector.open();
         Reader reader = new Reader(readSelector);
@@ -286,7 +298,6 @@ public abstract class HBaseServer {
         this.readSelector = readSelector;
       }
       public void run() {
-        LOG.info("Starting SocketReader");
         synchronized(this) {
           while (running) {
             SelectionKey key = null;
@@ -483,16 +494,16 @@ public abstract class HBaseServer {
         try {
           reader.startAdd();
           SelectionKey readKey = reader.registerChannel(channel);
-        c = new Connection(channel, System.currentTimeMillis());
-        readKey.attach(c);
-        synchronized (connectionList) {
-          connectionList.add(numConnections, c);
-          numConnections++;
-        }
-        if (LOG.isDebugEnabled())
-          LOG.debug("Server connection from " + c.toString() +
-              "; # active connections: " + numConnections +
-              "; # queued calls: " + callQueue.size());
+          c = new Connection(channel, System.currentTimeMillis());
+          readKey.attach(c);
+          synchronized (connectionList) {
+            connectionList.add(numConnections, c);
+            numConnections++;
+          }
+          if (LOG.isDebugEnabled())
+            LOG.debug("Server connection from " + c.toString() +
+                "; # active connections: " + numConnections +
+                "; # queued calls: " + callQueue.size());
         } finally {
           reader.finishAdd();
         }
@@ -512,7 +523,7 @@ public abstract class HBaseServer {
       } catch (InterruptedException ieo) {
         throw ieo;
       } catch (Exception e) {
-        LOG.debug(getName() + ": readAndProcess threw exception " + e + ". Count of bytes read: " + count, e);
+        LOG.warn(getName() + ": readAndProcess threw exception " + e + ". Count of bytes read: " + count, e);
         count = -1; //so that the (count < 0) block is executed
       }
       if (count < 0) {
@@ -952,8 +963,7 @@ public abstract class HBaseServer {
        */
       DataInputStream in =
         new DataInputStream(new ByteArrayInputStream(data.array()));
-      String username = WritableUtils.readString(in);
-      ticket = UserGroupInformation.createRemoteUser(username);
+      ticket = (UserGroupInformation) ObjectWritable.readObject(in, conf);
     }
 
     private void processData() throws  IOException, InterruptedException {
@@ -992,6 +1002,8 @@ public abstract class HBaseServer {
   /** Handles queued calls . */
   private class Handler extends Thread {
     private final BlockingQueue<Call> myCallQueue;
+    static final int BUFFER_INITIAL_SIZE = 1024;
+
     public Handler(final BlockingQueue<Call> cq, int instanceNumber) {
       this.myCallQueue = cq;
       this.setDaemon(true);
@@ -1008,11 +1020,9 @@ public abstract class HBaseServer {
     public void run() {
       LOG.info(getName() + ": starting");
       SERVER.set(HBaseServer.this);
-      final int buffersize = 16 * 1024;
-      ByteArrayOutputStream buf = new ByteArrayOutputStream(buffersize);
       while (running) {
         try {
-          final Call call = myCallQueue.take(); // pop the queue; maybe blocked here
+          Call call = myCallQueue.take(); // pop the queue; maybe blocked here
 
           if (LOG.isDebugEnabled())
             LOG.debug(getName() + ": has #" + call.id + " from " +
@@ -1024,19 +1034,9 @@ public abstract class HBaseServer {
 
           CurCall.set(call);
           try {
-/*
-TODO: Currently we do not assume the context of the user who is
-requesting, since security hasn't been fully integrated in HBase.
-
-            value = call.connection.ticket.doAs(
-              new PrivilegedExceptionAction<Writable>() {
-                @Override
-                public Writable run() throws Exception {
-                  return call(call.param, call.timestamp);
-                }
-              });
-*/
-            value = call(call.param, call.timestamp);
+            if (!started)
+              throw new ServerNotRunningException("Server is not running yet");
+            value = call(call.param, call.timestamp);             // make the call
           } catch (Throwable e) {
             LOG.debug(getName()+", call "+call+": error: " + e, e);
             errorClass = e.getClass().getName();
@@ -1044,14 +1044,24 @@ requesting, since security hasn't been fully integrated in HBase.
           }
           CurCall.set(null);
 
-          if (buf.size() > buffersize) {
-            // Allocate a new BAOS as reset only moves size back to zero but
-            // keeps the buffer of whatever the largest write was -- see
-            // hbase-900.
-            buf = new ByteArrayOutputStream(buffersize);
-          } else {
-            buf.reset();
+          int size = BUFFER_INITIAL_SIZE;
+          if (value instanceof WritableWithSize) {
+            // get the size hint.
+            WritableWithSize ohint = (WritableWithSize)value;
+            long hint = ohint.getWritableSize() + Bytes.SIZEOF_BYTE + Bytes.SIZEOF_INT;
+            if (hint > 0) {
+              if ((hint) > Integer.MAX_VALUE) {
+                // oops, new problem.
+                IOException ioe =
+                    new IOException("Result buffer size too large: " + hint);
+                errorClass = ioe.getClass().getName();
+                error = StringUtils.stringifyException(ioe);
+              } else {
+                size = (int)hint;
+              }
+            }
           }
+          ByteBufferOutputStream buf = new ByteBufferOutputStream(size);
           DataOutputStream out = new DataOutputStream(buf);
           out.writeInt(call.id);                // write call id
           out.writeBoolean(error != null);      // write error flag
@@ -1062,7 +1072,14 @@ requesting, since security hasn't been fully integrated in HBase.
             WritableUtils.writeString(out, errorClass);
             WritableUtils.writeString(out, error);
           }
-          call.setResponse(ByteBuffer.wrap(buf.toByteArray()));
+
+          if (buf.size() > warnResponseSize) {
+            LOG.warn(getName()+", responseTooLarge for: "+call+": Size: "
+                     + StringUtils.humanReadableInt(buf.size()));
+          }
+
+
+          call.setResponse(buf.getByteBuffer());
           responder.doRespond(call);
         } catch (InterruptedException e) {
           if (running) {                          // unexpected -- log it
@@ -1080,7 +1097,7 @@ requesting, since security hasn't been fully integrated in HBase.
             throw e;
           }
         } catch (Exception e) {
-          LOG.info(getName() + " caught: " +
+          LOG.warn(getName() + " caught: " +
                    StringUtils.stringifyException(e));
         }
       }
@@ -1153,6 +1170,10 @@ requesting, since security hasn't been fully integrated in HBase.
     this.tcpNoDelay = conf.getBoolean("ipc.server.tcpnodelay", false);
     this.tcpKeepAlive = conf.getBoolean("ipc.server.tcpkeepalive", true);
 
+    this.warnResponseSize = conf.getInt(WARN_RESPONSE_SIZE,
+                                        DEFAULT_WARN_RESPONSE_SIZE);
+
+
     // Create the responder here
     responder = new Responder();
   }
@@ -1171,7 +1192,23 @@ requesting, since security hasn't been fully integrated in HBase.
   public void setSocketSendBufSize(int size) { this.socketSendBufferSize = size; }
 
   /** Starts the service.  Must be called before any calls will be handled. */
-  public synchronized void start() {
+  public void start() {
+    startThreads();
+    openServer();
+  }
+
+  /**
+   * Open a previously started server.
+   */
+  public void openServer() {
+    started = true;
+  }
+
+  /**
+   * Starts the service threads but does not allow requests to be responded yet.
+   * Client will get {@link ServerNotRunningException} instead.
+   */
+  public synchronized void startThreads() {
     responder.start();
     listener.start();
     handlers = new Handler[handlerCount];
@@ -1267,6 +1304,13 @@ requesting, since security hasn't been fully integrated in HBase.
    */
   public void setErrorHandler(HBaseRPCErrorHandler handler) {
     this.errorHandler = handler;
+  }
+
+  /**
+   * Returns the metrics instance for reporting RPC call statistics
+   */
+  public HBaseRpcMetrics getRpcMetrics() {
+    return rpcMetrics;
   }
 
   /**

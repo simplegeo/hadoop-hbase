@@ -40,6 +40,7 @@ import javax.ws.rs.core.UriInfo;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
+import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.rest.model.ScannerModel;
 
@@ -50,16 +51,16 @@ public class ScannerResource extends ResourceBase {
   static final Map<String,ScannerInstanceResource> scanners =
    Collections.synchronizedMap(new HashMap<String,ScannerInstanceResource>());
 
-  String tableName;
+  TableResource tableResource;
 
   /**
    * Constructor
-   * @param table
+   * @param tableResource
    * @throws IOException
    */
-  public ScannerResource(String table) throws IOException {
+  public ScannerResource(TableResource tableResource)throws IOException {
     super();
-    this.tableName = table;
+    this.tableResource = tableResource;
   }
 
   static void delete(final String id) {
@@ -69,18 +70,22 @@ public class ScannerResource extends ResourceBase {
     }
   }
 
-  Response update(final ScannerModel model, final boolean replace, 
+  Response update(final ScannerModel model, final boolean replace,
       final UriInfo uriInfo) {
     servlet.getMetrics().incrementRequests(1);
+    if (servlet.isReadOnly()) {
+      throw new WebApplicationException(Response.Status.FORBIDDEN);
+    }
     byte[] endRow = model.hasEndRow() ? model.getEndRow() : null;
     RowSpec spec = new RowSpec(model.getStartRow(), endRow,
       model.getColumns(), model.getStartTime(), model.getEndTime(), 1);
     try {
       Filter filter = ScannerResultGenerator.buildFilterFromModel(model);
-      ScannerResultGenerator gen = 
+      String tableName = tableResource.getName();
+      ScannerResultGenerator gen =
         new ScannerResultGenerator(tableName, spec, filter);
       String id = gen.getID();
-      ScannerInstanceResource instance = 
+      ScannerInstanceResource instance =
         new ScannerInstanceResource(tableName, id, gen, model.getBatch());
       scanners.put(id, instance);
       if (LOG.isDebugEnabled()) {
@@ -92,6 +97,11 @@ public class ScannerResource extends ResourceBase {
     } catch (IOException e) {
       throw new WebApplicationException(e,
               Response.Status.SERVICE_UNAVAILABLE);
+    } catch (RuntimeException e) {
+      if (e.getCause() instanceof TableNotFoundException) {
+        throw new WebApplicationException(e, Response.Status.NOT_FOUND);
+      }
+      throw new WebApplicationException(e, Response.Status.BAD_REQUEST);
     } catch (Exception e) {
       throw new WebApplicationException(e, Response.Status.BAD_REQUEST);
     }

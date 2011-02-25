@@ -21,15 +21,8 @@
 package org.apache.hadoop.hbase.rest;
 
 import java.io.IOException;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.HColumnDescriptor;
-import org.apache.hadoop.hbase.client.HTableInterface;
 import org.apache.hadoop.hbase.client.HTablePool;
 import org.apache.hadoop.hbase.rest.metrics.RESTMetrics;
 
@@ -37,33 +30,44 @@ import org.apache.hadoop.hbase.rest.metrics.RESTMetrics;
  * Singleton class encapsulating global REST servlet state and functions.
  */
 public class RESTServlet implements Constants {
-
-  private static RESTServlet instance;
-
-  Configuration conf;
-  HTablePool pool;
-  AtomicBoolean stopping = new AtomicBoolean(false);
-  Map<String,Integer> maxAgeMap = 
-    Collections.synchronizedMap(new HashMap<String,Integer>());
-  RESTMetrics metrics = new RESTMetrics();
+  private static RESTServlet INSTANCE;
+  private final Configuration conf;
+  private final HTablePool pool;
+  private final RESTMetrics metrics = new RESTMetrics();
 
   /**
    * @return the RESTServlet singleton instance
    * @throws IOException
    */
   public synchronized static RESTServlet getInstance() throws IOException {
-    if (instance == null) {
-      instance = new RESTServlet();
-    }
-    return instance;
+    assert(INSTANCE != null);
+    return INSTANCE;
   }
 
   /**
-   * Constructor
+   * @param conf Existing configuration to use in rest servlet
+   * @return the RESTServlet singleton instance
    * @throws IOException
    */
-  public RESTServlet() throws IOException {
-    this.conf = HBaseConfiguration.create();
+  public synchronized static RESTServlet getInstance(Configuration conf)
+  throws IOException {
+    if (INSTANCE == null) {
+      INSTANCE = new RESTServlet(conf);
+    }
+    return INSTANCE;
+  }
+
+  public synchronized static void stop() {
+    if (INSTANCE != null)  INSTANCE = null;
+  }
+
+  /**
+   * Constructor with existing configuration
+   * @param conf existing configuration
+   * @throws IOException.
+   */
+  RESTServlet(Configuration conf) throws IOException {
+    this.conf = conf;
     this.pool = new HTablePool(conf, 10);
   }
 
@@ -80,42 +84,11 @@ public class RESTServlet implements Constants {
   }
 
   /**
-   * @param tableName the table name
-   * @return the maximum cache age suitable for use with this table, in
-   *  seconds 
-   * @throws IOException
+   * Helper method to determine if server should
+   * only respond to GET HTTP method requests.
+   * @return boolean for server read-only state
    */
-  public int getMaxAge(String tableName) throws IOException {
-    Integer i = maxAgeMap.get(tableName);
-    if (i != null) {
-      return i.intValue();
-    }
-    HTableInterface table = pool.getTable(tableName);
-    try {
-      int maxAge = DEFAULT_MAX_AGE;
-      for (HColumnDescriptor family : 
-          table.getTableDescriptor().getFamilies()) {
-        int ttl = family.getTimeToLive();
-        if (ttl < 0) {
-          continue;
-        }
-        if (ttl < maxAge) {
-          maxAge = ttl;
-        }
-      }
-      maxAgeMap.put(tableName, maxAge);
-      return maxAge;
-    } finally {
-      pool.putTable(table);
-    }
-  }
-
-  /**
-   * Signal that a previously calculated maximum cache age has been
-   * invalidated by a schema change.
-   * @param tableName the table name
-   */
-  public void invalidateMaxAge(String tableName) {
-    maxAgeMap.remove(tableName);
+  boolean isReadOnly() {
+    return getConfiguration().getBoolean("hbase.rest.readonly", false);
   }
 }

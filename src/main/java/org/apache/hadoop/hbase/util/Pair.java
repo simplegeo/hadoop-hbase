@@ -89,7 +89,7 @@ public class Pair<T1, T2> implements Serializable
 
   private static boolean equals(Object x, Object y)
   {
-     return (x == null && y == null) || (x != null && x.equals(y));
+    return (x == null && y == null) || (x != null && x.equals(y));
   }
 
   @Override

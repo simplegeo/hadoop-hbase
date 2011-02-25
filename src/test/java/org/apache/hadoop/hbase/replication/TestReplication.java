@@ -19,16 +19,19 @@
  */
 package org.apache.hadoop.hbase.replication;
 
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.EmptyWatcher;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MiniZooKeeperCluster;
+import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.UnknownScannerException;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
@@ -38,17 +41,17 @@ import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.client.replication.ReplicationAdmin;
+import org.apache.hadoop.hbase.mapreduce.replication.VerifyReplication;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
-import org.junit.After;
+import org.apache.hadoop.hbase.util.JVMClusterUtil;
+import org.apache.hadoop.hbase.zookeeper.MiniZooKeeperCluster;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+import org.apache.hadoop.mapreduce.Job;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
-
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
 
 public class TestReplication {
 
@@ -57,8 +60,11 @@ public class TestReplication {
   private static Configuration conf1;
   private static Configuration conf2;
 
-  private static ZooKeeperWrapper zkw1;
-  private static ZooKeeperWrapper zkw2;
+  private static ZooKeeperWatcher zkw1;
+  private static ZooKeeperWatcher zkw2;
+
+  private static ReplicationAdmin admin;
+  private static String slaveClusterKey;
 
   private static HTable htable1;
   private static HTable htable2;
@@ -66,6 +72,8 @@ public class TestReplication {
   private static HBaseTestingUtility utility1;
   private static HBaseTestingUtility utility2;
   private static final int NB_ROWS_IN_BATCH = 100;
+  private static final int NB_ROWS_IN_BIG_BATCH =
+      NB_ROWS_IN_BATCH * 10;
   private static final long SLEEP_TIME = 500;
   private static final int NB_RETRIES = 10;
 
@@ -89,7 +97,6 @@ public class TestReplication {
     conf1.setInt("hbase.regionserver.maxlogs", 10);
     conf1.setLong("hbase.master.logcleaner.ttl", 10);
     conf1.setLong("hbase.client.retries.number", 5);
-    conf1.setLong("hbase.regions.percheckin", 1);
     conf1.setBoolean(HConstants.REPLICATION_ENABLE_KEY, true);
     conf1.setBoolean("dfs.support.append", true);
     conf1.setLong(HConstants.THREAD_WAKE_FREQUENCY, 100);
@@ -97,13 +104,8 @@ public class TestReplication {
     utility1 = new HBaseTestingUtility(conf1);
     utility1.startMiniZKCluster();
     MiniZooKeeperCluster miniZK = utility1.getZkCluster();
-    zkw1 = ZooKeeperWrapper.createInstance(conf1, "cluster1");
-    zkw1.writeZNode("/1", "replication", "");
-    zkw1.writeZNode("/1/replication", "master",
-        conf1.get(HConstants.ZOOKEEPER_QUORUM)+":" +
-            conf1.get("hbase.zookeeper.property.clientPort")+":/1");
-    setIsReplication(true);
-
+    zkw1 = new ZooKeeperWatcher(conf1, "cluster1", null);
+    admin = new ReplicationAdmin(conf1);
     LOG.info("Setup first Zk");
 
     conf2 = HBaseConfiguration.create();
@@ -111,19 +113,15 @@ public class TestReplication {
     conf2.setInt("hbase.client.retries.number", 6);
     conf2.setBoolean(HConstants.REPLICATION_ENABLE_KEY, true);
     conf2.setBoolean("dfs.support.append", true);
-    conf2.setLong("hbase.regions.percheckin", 1);
 
     utility2 = new HBaseTestingUtility(conf2);
     utility2.setZkCluster(miniZK);
-    zkw2 = ZooKeeperWrapper.createInstance(conf2, "cluster2");
-    zkw2.writeZNode("/2", "replication", "");
-    zkw2.writeZNode("/2/replication", "master",
-        conf1.get(HConstants.ZOOKEEPER_QUORUM)+":" +
-            conf1.get("hbase.zookeeper.property.clientPort")+":/1");
+    zkw2 = new ZooKeeperWatcher(conf2, "cluster2", null);
 
-    zkw1.writeZNode("/1/replication/peers", "1",
-        conf2.get(HConstants.ZOOKEEPER_QUORUM)+":" +
-            conf2.get("hbase.zookeeper.property.clientPort")+":/2");
+    slaveClusterKey = conf2.get(HConstants.ZOOKEEPER_QUORUM)+":" +
+            conf2.get("hbase.zookeeper.property.clientPort")+":/2";
+    admin.addPeer("2", slaveClusterKey);
+    setIsReplication(true);
 
     LOG.info("Setup second Zk");
 
@@ -131,7 +129,6 @@ public class TestReplication {
     utility2.startMiniCluster(2);
 
     HTableDescriptor table = new HTableDescriptor(tableName);
-    table.setDeferredLogFlush(false);
     HColumnDescriptor fam = new HColumnDescriptor(famName);
     fam.setScope(HConstants.REPLICATION_SCOPE_GLOBAL);
     table.addFamily(fam);
@@ -149,8 +146,7 @@ public class TestReplication {
 
   private static void setIsReplication(boolean rep) throws Exception {
     LOG.info("Set rep " + rep);
-    zkw1.writeZNode("/1/replication", "state", Boolean.toString(rep));
-    // Takes some ms for ZK to fire the watcher
+    admin.setReplicating(rep);
     Thread.sleep(SLEEP_TIME);
   }
 
@@ -159,12 +155,39 @@ public class TestReplication {
    */
   @Before
   public void setUp() throws Exception {
-    setIsReplication(false);
+
+    // Starting and stopping replication can make us miss new logs,
+    // rolling like this makes sure the most recent one gets added to the queue
+    for ( JVMClusterUtil.RegionServerThread r :
+        utility1.getHBaseCluster().getRegionServerThreads()) {
+      r.getRegionServer().getWAL().rollWriter();
+    }
     utility1.truncateTable(tableName);
-    utility2.truncateTable(tableName);
-    // If test is flaky, set that sleep higher
-    Thread.sleep(SLEEP_TIME*8);
-    setIsReplication(true);
+    // truncating the table will send one Delete per row to the slave cluster
+    // in an async fashion, which is why we cannot just call truncateTable on
+    // utility2 since late writes could make it to the slave in some way.
+    // Instead, we truncate the first table and wait for all the Deletes to
+    // make it to the slave.
+    Scan scan = new Scan();
+    int lastCount = 0;
+    for (int i = 0; i < NB_RETRIES; i++) {
+      if (i==NB_RETRIES-1) {
+        fail("Waited too much time for truncate");
+      }
+      ResultScanner scanner = htable2.getScanner(scan);
+      Result[] res = scanner.next(NB_ROWS_IN_BIG_BATCH);
+      scanner.close();
+      if (res.length != 0) {
+       if (res.length < lastCount) {
+          i--; // Don't increment timeout if we make progress
+        }
+        lastCount = res.length;
+        LOG.info("Still got " + res.length + " rows");
+        Thread.sleep(SLEEP_TIME);
+      } else {
+        break;
+      }
+    }
   }
 
   /**
@@ -189,13 +212,12 @@ public class TestReplication {
     htable1 = new HTable(conf1, tableName);
     htable1.put(put);
 
-    HTable table2 = new HTable(conf2, tableName);
     Get get = new Get(row);
     for (int i = 0; i < NB_RETRIES; i++) {
       if (i==NB_RETRIES-1) {
         fail("Waited too much time for put replication");
       }
-      Result res = table2.get(get);
+      Result res = htable2.get(get);
       if (res.size() == 0) {
         LOG.info("Row not available");
         Thread.sleep(SLEEP_TIME);
@@ -208,13 +230,12 @@ public class TestReplication {
     Delete del = new Delete(row);
     htable1.delete(del);
 
-    table2 = new HTable(conf2, tableName);
     get = new Get(row);
     for (int i = 0; i < NB_RETRIES; i++) {
       if (i==NB_RETRIES-1) {
         fail("Waited too much time for del replication");
       }
-      Result res = table2.get(get);
+      Result res = htable2.get(get);
       if (res.size() >= 1) {
         LOG.info("Row not deleted");
         Thread.sleep(SLEEP_TIME);
@@ -337,6 +358,59 @@ public class TestReplication {
   }
 
   /**
+   * Integration test for TestReplicationAdmin, removes and re-add a peer
+   * cluster
+   * @throws Exception
+   */
+  @Test
+  public void testAddAndRemoveClusters() throws Exception {
+    LOG.info("testAddAndRemoveClusters");
+    admin.removePeer("2");
+    Thread.sleep(SLEEP_TIME);
+    byte[] rowKey = Bytes.toBytes("Won't be replicated");
+    Put put = new Put(rowKey);
+    put.add(famName, row, row);
+    htable1.put(put);
+
+    Get get = new Get(rowKey);
+    for (int i = 0; i < NB_RETRIES; i++) {
+      if (i == NB_RETRIES-1) {
+        break;
+      }
+      Result res = htable2.get(get);
+      if (res.size() >= 1) {
+        fail("Not supposed to be replicated");
+      } else {
+        LOG.info("Row not replicated, let's wait a bit more...");
+        Thread.sleep(SLEEP_TIME);
+      }
+    }
+
+    admin.addPeer("2", slaveClusterKey);
+    Thread.sleep(SLEEP_TIME);
+    rowKey = Bytes.toBytes("do rep");
+    put = new Put(rowKey);
+    put.add(famName, row, row);
+    LOG.info("Adding new row");
+    htable1.put(put);
+
+    get = new Get(rowKey);
+    for (int i = 0; i < NB_RETRIES; i++) {
+      if (i==NB_RETRIES-1) {
+        fail("Waited too much time for put replication");
+      }
+      Result res = htable2.get(get);
+      if (res.size() == 0) {
+        LOG.info("Row not available");
+        Thread.sleep(SLEEP_TIME*i);
+      } else {
+        assertArrayEquals(res.value(), row);
+        break;
+      }
+    }
+  }
+
+  /**
    * Do a more intense version testSmallBatch, one  that will trigger
    * hlog rolling and other non-trivial code paths
    * @throws Exception
@@ -345,7 +419,7 @@ public class TestReplication {
   public void loadTesting() throws Exception {
     htable1.setWriteBufferSize(1024);
     htable1.setAutoFlush(false);
-    for (int i = 0; i < NB_ROWS_IN_BATCH *10; i++) {
+    for (int i = 0; i < NB_ROWS_IN_BIG_BATCH; i++) {
       Put put = new Put(Bytes.toBytes(i));
       put.add(famName, row, row);
       htable1.put(put);
@@ -355,7 +429,7 @@ public class TestReplication {
     Scan scan = new Scan();
 
     ResultScanner scanner = htable1.getScanner(scan);
-    Result[] res = scanner.next(NB_ROWS_IN_BATCH * 100);
+    Result[] res = scanner.next(NB_ROWS_IN_BIG_BATCH);
     scanner.close();
 
     assertEquals(NB_ROWS_IN_BATCH *10, res.length);
@@ -365,9 +439,9 @@ public class TestReplication {
     for (int i = 0; i < NB_RETRIES; i++) {
 
       scanner = htable2.getScanner(scan);
-      res = scanner.next(NB_ROWS_IN_BATCH * 100);
+      res = scanner.next(NB_ROWS_IN_BIG_BATCH);
       scanner.close();
-      if (res.length != NB_ROWS_IN_BATCH *10) {
+      if (res.length != NB_ROWS_IN_BIG_BATCH) {
         if (i == NB_RETRIES-1) {
           int lastRow = -1;
           for (Result result : res) {
@@ -379,7 +453,7 @@ public class TestReplication {
           }
           LOG.error("Last row: " + lastRow);
           fail("Waited too much time for normal batch replication, "
-              + res.length + " instead of " + NB_ROWS_IN_BATCH *10);
+              + res.length + " instead of " + NB_ROWS_IN_BIG_BATCH);
         } else {
           LOG.info("Only got " + res.length + " rows");
           Thread.sleep(SLEEP_TIME);
@@ -391,8 +465,61 @@ public class TestReplication {
   }
 
   /**
+   * Do a small loading into a table, make sure the data is really the same,
+   * then run the VerifyReplication job to check the results. Do a second
+   * comparison where all the cells are different.
+   * @throws Exception
+   */
+  @Test
+  public void testVerifyRepJob() throws Exception {
+    // Populate the tables, at the same time it guarantees that the tables are
+    // identical since it does the check
+    testSmallBatch();
+
+    String[] args = new String[] {"2", Bytes.toString(tableName)};
+    Job job = VerifyReplication.createSubmittableJob(conf1, args);
+    if (job == null) {
+      fail("Job wasn't created, see the log");
+    }
+    if (!job.waitForCompletion(true)) {
+      fail("Job failed, see the log");
+    }
+    assertEquals(NB_ROWS_IN_BATCH, job.getCounters().
+        findCounter(VerifyReplication.Verifier.Counters.GOODROWS).getValue());
+    assertEquals(0, job.getCounters().
+        findCounter(VerifyReplication.Verifier.Counters.BADROWS).getValue());
+
+    Scan scan = new Scan();
+    ResultScanner rs = htable2.getScanner(scan);
+    Put put = null;
+    for (Result result : rs) {
+      put = new Put(result.getRow());
+      KeyValue firstVal = result.raw()[0];
+      put.add(firstVal.getFamily(),
+          firstVal.getQualifier(), Bytes.toBytes("diff data"));
+      htable2.put(put);
+    }
+    Delete delete = new Delete(put.getRow());
+    htable2.delete(delete);
+    job = VerifyReplication.createSubmittableJob(conf1, args);
+    if (job == null) {
+      fail("Job wasn't created, see the log");
+    }
+    if (!job.waitForCompletion(true)) {
+      fail("Job failed, see the log");
+    }
+    assertEquals(0, job.getCounters().
+            findCounter(VerifyReplication.Verifier.Counters.GOODROWS).getValue());
+        assertEquals(NB_ROWS_IN_BATCH, job.getCounters().
+            findCounter(VerifyReplication.Verifier.Counters.BADROWS).getValue());
+  }
+
+  /**
    * Load up multiple tables over 2 region servers and kill a source during
    * the upload. The failover happens internally.
+   *
+   * WARNING this test sometimes fails because of HBASE-3515
+   *
    * @throws Exception
    */
   @Test

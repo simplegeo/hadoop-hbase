@@ -19,69 +19,74 @@
  */
 package org.apache.hadoop.hbase.replication.regionserver;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.HServerInfo;
-import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.regionserver.wal.HLog;
-import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
-import org.apache.hadoop.hbase.regionserver.wal.LogEntryVisitor;
-import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
-import org.apache.hadoop.hbase.replication.ReplicationZookeeperWrapper;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
-
 import java.io.IOException;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Replication serves as an umbrella over the setup of replication and
- * is used by HRS.
- */
-public class Replication implements LogEntryVisitor {
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.Server;
+import org.apache.hadoop.hbase.regionserver.wal.HLog;
+import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
+import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.regionserver.wal.WALObserver;
+import org.apache.hadoop.hbase.replication.ReplicationZookeeper;
+import org.apache.hadoop.hbase.replication.master.ReplicationLogCleaner;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.zookeeper.KeeperException;
 
+import static org.apache.hadoop.hbase.HConstants.HBASE_MASTER_LOGCLEANER_PLUGINS;
+import static org.apache.hadoop.hbase.HConstants.REPLICATION_ENABLE_KEY;
+import static org.apache.hadoop.hbase.HConstants.REPLICATION_SCOPE_LOCAL;
+
+/**
+ * Gateway to Replication.  Used by {@link org.apache.hadoop.hbase.regionserver.HRegionServer}.
+ */
+public class Replication implements WALObserver {
   private final boolean replication;
   private final ReplicationSourceManager replicationManager;
-  private boolean replicationMaster;
   private final AtomicBoolean replicating = new AtomicBoolean(true);
-  private final ReplicationZookeeperWrapper zkHelper;
+  private final ReplicationZookeeper zkHelper;
   private final Configuration conf;
-  private final AtomicBoolean  stopRequested;
   private ReplicationSink replicationSink;
+  // Hosting server
+  private final Server server;
 
   /**
    * Instantiate the replication management (if rep is enabled).
-   * @param conf conf to use
-   * @param hsi the info if this region server
+   * @param server Hosting server
    * @param fs handle to the filesystem
+   * @param logDir
    * @param oldLogDir directory where logs are archived
-   * @param stopRequested boolean that tells us if we are shutting down
    * @throws IOException
+   * @throws KeeperException 
    */
-  public Replication(Configuration conf, HServerInfo hsi,
-                     FileSystem fs, Path logDir, Path oldLogDir,
-                     AtomicBoolean stopRequested) throws IOException {
-    this.conf = conf;
-    this.stopRequested = stopRequested;
-    this.replication =
-        conf.getBoolean(HConstants.REPLICATION_ENABLE_KEY, false);
+  public Replication(final Server server, final FileSystem fs,
+      final Path logDir, final Path oldLogDir)
+  throws IOException, KeeperException {
+    this.server = server;
+    this.conf = this.server.getConfiguration();
+    this.replication = isReplication(this.conf);
     if (replication) {
-      this.zkHelper = new ReplicationZookeeperWrapper(
-        ZooKeeperWrapper.createInstance(conf, hsi.getServerName()), conf,
-        this.replicating, hsi.getServerName());
-      this.replicationMaster = zkHelper.isReplicationMaster();
-      this.replicationManager = this.replicationMaster ?
-        new ReplicationSourceManager(zkHelper, conf, stopRequested,
-          fs, this.replicating, logDir, oldLogDir) : null;
+      this.zkHelper = new ReplicationZookeeper(server, this.replicating);
+      this.replicationManager = new ReplicationSourceManager(zkHelper, conf,
+          this.server, fs, this.replicating, logDir, oldLogDir) ;
     } else {
-      replicationManager = null;
-      zkHelper = null;
+      this.replicationManager = null;
+      this.zkHelper = null;
     }
+  }
+
+  /**
+   * @param c Configuration to look at
+   * @return True if replication is enabled.
+   */
+  public static boolean isReplication(final Configuration c) {
+    return c.getBoolean(REPLICATION_ENABLE_KEY, false);
   }
 
   /**
@@ -89,10 +94,7 @@ public class Replication implements LogEntryVisitor {
    */
   public void join() {
     if (this.replication) {
-      if (this.replicationMaster) {
-        this.replicationManager.join();
-      }
-      this.zkHelper.deleteOwnRSZNode();
+      this.replicationManager.join();
     }
   }
 
@@ -102,7 +104,7 @@ public class Replication implements LogEntryVisitor {
    * @throws IOException
    */
   public void replicateLogEntries(HLog.Entry[] entries) throws IOException {
-    if (this.replication && !this.replicationMaster) {
+    if (this.replication) {
       this.replicationSink.replicateEntries(entries);
     }
   }
@@ -114,12 +116,8 @@ public class Replication implements LogEntryVisitor {
    */
   public void startReplicationServices() throws IOException {
     if (this.replication) {
-      if (this.replicationMaster) {
-        this.replicationManager.init();
-      } else {
-        this.replicationSink =
-            new ReplicationSink(this.conf, this.stopRequested);
-      }
+      this.replicationManager.init();
+      this.replicationSink = new ReplicationSink(this.conf, this.server);
     }
   }
 
@@ -128,19 +126,19 @@ public class Replication implements LogEntryVisitor {
    * @return the manager if replication is enabled, else returns false
    */
   public ReplicationSourceManager getReplicationManager() {
-    return replicationManager;
+    return this.replicationManager;
   }
 
   @Override
   public void visitLogEntryBeforeWrite(HRegionInfo info, HLogKey logKey,
-                                       WALEdit logEdit) {
+      WALEdit logEdit) {
     NavigableMap<byte[], Integer> scopes =
         new TreeMap<byte[], Integer>(Bytes.BYTES_COMPARATOR);
     byte[] family;
     for (KeyValue kv : logEdit.getKeyValues()) {
       family = kv.getFamily();
       int scope = info.getTableDesc().getFamily(family).getScope();
-      if (scope != HConstants.REPLICATION_SCOPE_LOCAL &&
+      if (scope != REPLICATION_SCOPE_LOCAL &&
           !scopes.containsKey(family)) {
         scopes.put(family, scope);
       }
@@ -150,13 +148,34 @@ public class Replication implements LogEntryVisitor {
     }
   }
 
+  @Override
+  public void logRolled(Path p) {
+    getReplicationManager().logRolled(p);
+  }
+
   /**
-   * Add this class as a log entry visitor for HLog if replication is enabled
-   * @param hlog log that was add ourselves on
+   * This method modifies the master's configuration in order to inject
+   * replication-related features
+   * @param conf
    */
-  public void addLogEntryVisitor(HLog hlog) {
-    if (replication) {
-      hlog.addLogEntryVisitor(this);
+  public static void decorateMasterConfiguration(Configuration conf) {
+    if (!isReplication(conf)) {
+      return;
     }
+    String plugins = conf.get(HBASE_MASTER_LOGCLEANER_PLUGINS);
+    if (!plugins.contains(ReplicationLogCleaner.class.toString())) {
+      conf.set(HBASE_MASTER_LOGCLEANER_PLUGINS,
+          plugins + "," + ReplicationLogCleaner.class.getCanonicalName());
+    }
+  }
+
+  @Override
+  public void logRollRequested() {
+    // Not interested
+  }
+
+  @Override
+  public void logCloseRequested() {
+    // not interested
   }
 }

@@ -43,12 +43,13 @@ import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.io.hfile.HFile;
+import org.apache.hadoop.hbase.regionserver.FlushRequester;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.Store;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdge;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
-import org.apache.hadoop.security.UserGroupInformation;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -129,6 +130,7 @@ public class TestWALReplay {
     HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
     Path basedir = new Path(hbaseRootDir, tableNameStr);
     deleteDir(basedir);
+    fs.mkdirs(new Path(basedir, hri.getEncodedName()));
 
     final byte [] tableName = Bytes.toBytes(tableNameStr);
     final byte [] rowName = tableName;
@@ -171,10 +173,10 @@ public class TestWALReplay {
    * Test case of HRegion that is only made out of bulk loaded files.  Assert
    * that we don't 'crash'.
    * @throws IOException
-   * @throws IllegalAccessException 
-   * @throws NoSuchFieldException 
-   * @throws IllegalArgumentException 
-   * @throws SecurityException 
+   * @throws IllegalAccessException
+   * @throws NoSuchFieldException
+   * @throws IllegalArgumentException
+   * @throws SecurityException
    */
   @Test
   public void testRegionMadeOfBulkLoadedFilesOnly()
@@ -185,7 +187,7 @@ public class TestWALReplay {
     final Path basedir = new Path(this.hbaseRootDir, tableNameStr);
     deleteDir(basedir);
     HLog wal = createWAL(this.conf);
-    HRegion region = HRegion.openHRegion(hri, basedir, wal, this.conf);
+    HRegion region = HRegion.openHRegion(hri, wal, this.conf);
     Path f =  new Path(basedir, "hfile");
     HFile.Writer writer = new HFile.Writer(this.fs, f);
     byte [] family = hri.getTableDesc().getFamilies().iterator().next().getName();
@@ -198,21 +200,21 @@ public class TestWALReplay {
     wal.sync();
 
     // Now 'crash' the region by stealing its wal
-    UserGroupInformation newUGI = HBaseTestingUtility.getDifferentUser(this.conf,
+    final Configuration newConf = HBaseConfiguration.create(this.conf);
+    User user = HBaseTestingUtility.getDifferentUser(newConf,
         tableNameStr);
-    newUGI.doAs(new PrivilegedExceptionAction<Object>() {
+    user.runAs(new PrivilegedExceptionAction() {
       public Object run() throws Exception {
-        runWALSplit(conf);
-        HLog wal2 = createWAL(conf);
-        HRegion region2 = new HRegion(basedir, wal2, FileSystem.get(conf),
-          conf, hri, null);
+        runWALSplit(newConf);
+        HLog wal2 = createWAL(newConf);
+        HRegion region2 = new HRegion(basedir, wal2, FileSystem.get(newConf),
+          newConf, hri, null);
         long seqid2 = region2.initialize();
         assertTrue(seqid2 > -1);
 
         // I can't close wal1.  Its been appropriated when we split.
         region2.close();
         wal2.closeAndDelete();
-
         return null;
       }
     });
@@ -222,10 +224,10 @@ public class TestWALReplay {
    * Test writing edits into an HRegion, closing it, splitting logs, opening
    * Region again.  Verify seqids.
    * @throws IOException
-   * @throws IllegalAccessException 
-   * @throws NoSuchFieldException 
-   * @throws IllegalArgumentException 
-   * @throws SecurityException 
+   * @throws IllegalAccessException
+   * @throws NoSuchFieldException
+   * @throws IllegalArgumentException
+   * @throws SecurityException
    */
   @Test
   public void testReplayEditsWrittenViaHRegion()
@@ -292,16 +294,17 @@ public class TestWALReplay {
     // Set down maximum recovery so we dfsclient doesn't linger retrying something
     // long gone.
     HBaseTestingUtility.setMaxRecoveryErrorCount(wal2.getOutputStream(), 1);
-    UserGroupInformation newUGI = HBaseTestingUtility.getDifferentUser(this.conf,
+    final Configuration newConf = HBaseConfiguration.create(this.conf);
+    User user = HBaseTestingUtility.getDifferentUser(newConf,
       tableNameStr);
-    newUGI.doAs(new PrivilegedExceptionAction<Object>() {
+    user.runAs(new PrivilegedExceptionAction() {
       public Object run() throws Exception {
-        runWALSplit(conf);
-        FileSystem newFS = FileSystem.get(conf);
+        runWALSplit(newConf);
+        FileSystem newFS = FileSystem.get(newConf);
         // Make a new wal for new region open.
-        HLog wal3 = createWAL(conf);
+        HLog wal3 = createWAL(newConf);
         final AtomicInteger countOfRestoredEdits = new AtomicInteger(0);
-        HRegion region3 = new HRegion(basedir, wal3, newFS, conf, hri, null) {
+        HRegion region3 = new HRegion(basedir, wal3, newFS, newConf, hri, null) {
           @Override
           protected boolean restoreEdit(Store s, KeyValue kv) {
             boolean b = super.restoreEdit(s, kv);
@@ -337,10 +340,11 @@ public class TestWALReplay {
     final HRegionInfo hri = createBasic3FamilyHRegionInfo(tableNameStr);
     final Path basedir = new Path(hbaseRootDir, tableNameStr);
     deleteDir(basedir);
+    fs.mkdirs(new Path(basedir, hri.getEncodedName()));
     final HLog wal = createWAL(this.conf);
     final byte[] tableName = Bytes.toBytes(tableNameStr);
     final byte[] rowName = tableName;
-    final byte[] regionName = hri.getRegionName();
+    final byte[] regionName = hri.getEncodedNameAsBytes();
 
     // Add 1k to each family.
     final int countPerFamily = 1000;
@@ -371,13 +375,12 @@ public class TestWALReplay {
     // Set down maximum recovery so we dfsclient doesn't linger retrying something
     // long gone.
     HBaseTestingUtility.setMaxRecoveryErrorCount(wal.getOutputStream(), 1);
-
-    // Make a new fs for the splitter and run as a new user so we can take
+    // Make a new conf and a new fs for the splitter to run on so we can take
     // over old wal.
-    UserGroupInformation newUGI = HBaseTestingUtility.getDifferentUser(this.conf,
+    final Configuration newConf = HBaseConfiguration.create(this.conf);
+    User user = HBaseTestingUtility.getDifferentUser(newConf,
       ".replay.wal.secondtime");
-    final Configuration newConf = new Configuration(conf);
-    newUGI.doAs(new PrivilegedExceptionAction<Object>() {
+    user.runAs(new PrivilegedExceptionAction(){
       public Object run() throws Exception {
         runWALSplit(newConf);
         FileSystem newFS = FileSystem.get(newConf);
@@ -410,14 +413,30 @@ public class TestWALReplay {
         } finally {
           newWal.closeAndDelete();
         }
-
         return null;
       }
     });
   }
 
+  // Flusher used in this test.  Keep count of how often we are called and
+  // actually run the flush inside here.
+  class TestFlusher implements FlushRequester {
+    private int count = 0;
+    private HRegion r;
+
+    @Override
+    public void requestFlush(HRegion region) {
+      count++;
+      try {
+        r.flushcache();
+      } catch (IOException e) {
+        throw new RuntimeException("Exception flushing", e);
+      }
+    }
+  }
+
   private void addWALEdits (final byte [] tableName, final HRegionInfo hri,
-      final byte [] rowName, final byte [] family, 
+      final byte [] rowName, final byte [] family,
       final int count, EnvironmentEdge ee, final HLog wal)
   throws IOException {
     String familyStr = Bytes.toString(family);
@@ -431,7 +450,7 @@ public class TestWALReplay {
     }
   }
 
-  private void addRegionEdits (final byte [] rowName, final byte [] family, 
+  private void addRegionEdits (final byte [] rowName, final byte [] family,
       final int count, EnvironmentEdge ee, final HRegion r,
       final String qualifierPrefix)
   throws IOException {
@@ -468,8 +487,9 @@ public class TestWALReplay {
    */
   private Path runWALSplit(final Configuration c) throws IOException {
     FileSystem fs = FileSystem.get(c);
-    List<Path> splits = HLog.splitLog(this.hbaseRootDir, this.logDir,
-      this.oldLogDir, fs, c);
+    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(c,
+        this.hbaseRootDir, this.logDir, this.oldLogDir, fs);
+    List<Path> splits = logSplitter.splitLog();
     // Split should generate only 1 file since there's only 1 region
     assertEquals(1, splits.size());
     // Make sure the file exists
@@ -484,7 +504,7 @@ public class TestWALReplay {
    * @throws IOException
    */
   private HLog createWAL(final Configuration c) throws IOException {
-    HLog wal = new HLog(FileSystem.get(c), logDir, oldLogDir, c, null);
+    HLog wal = new HLog(FileSystem.get(c), logDir, oldLogDir, c);
     // Set down maximum recovery so we dfsclient doesn't linger retrying something
     // long gone.
     HBaseTestingUtility.setMaxRecoveryErrorCount(wal.getOutputStream(), 1);

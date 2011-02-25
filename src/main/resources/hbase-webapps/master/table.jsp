@@ -9,8 +9,8 @@
   import="org.apache.hadoop.hbase.HServerInfo"
   import="org.apache.hadoop.hbase.io.ImmutableBytesWritable"
   import="org.apache.hadoop.hbase.master.HMaster" 
-  import="org.apache.hadoop.hbase.master.MetaRegion"
   import="org.apache.hadoop.hbase.util.Bytes"
+  import="org.apache.hadoop.hbase.util.FSUtils"
   import="java.util.Map"
   import="org.apache.hadoop.hbase.HConstants"%><%
   HMaster master = (HMaster)getServletContext().getAttribute(HMaster.MASTER);
@@ -19,11 +19,11 @@
   String tableName = request.getParameter("name");
   HTable table = new HTable(conf, tableName);
   String tableHeader = "<h2>Table Regions</h2><table><tr><th>Name</th><th>Region Server</th><th>Start Key</th><th>End Key</th></tr>";
-  HServerAddress rootLocation = master.getRegionManager().getRootRegionLocation();
+  HServerAddress rl = master.getCatalogTracker().getRootLocation();
   boolean showFragmentation = conf.getBoolean("hbase.master.ui.fragmentation.enabled", false);
   Map<String, Integer> frags = null;
   if (showFragmentation) {
-      frags = master.getTableFragmentation();
+      frags = FSUtils.getTableFragmentation(master);
   }
 %>
 
@@ -47,20 +47,17 @@
 <%
   if (action.equals("split")) {
     if (key != null && key.length() > 0) {
-      Writable[] arr = new Writable[1];
-      arr[0] = new ImmutableBytesWritable(Bytes.toBytes(key));
-      master.modifyTable(Bytes.toBytes(tableName), HConstants.Modify.TABLE_SPLIT, arr);
+      hbadmin.split(key);
     } else {
-      master.modifyTable(Bytes.toBytes(tableName), HConstants.Modify.TABLE_SPLIT, null);
+      hbadmin.split(tableName);
     }
+    
     %> Split request accepted. <%
   } else if (action.equals("compact")) {
     if (key != null && key.length() > 0) {
-      Writable[] arr = new Writable[1];
-      arr[0] = new ImmutableBytesWritable(Bytes.toBytes(key));
-      master.modifyTable(Bytes.toBytes(tableName), HConstants.Modify.TABLE_COMPACT, arr);
+      hbadmin.compact(key);
     } else {
-      master.modifyTable(Bytes.toBytes(tableName), HConstants.Modify.TABLE_COMPACT, null);
+      hbadmin.compact(tableName);
     }
     %> Compact request accepted. <%
   }
@@ -84,12 +81,12 @@
 %>
 <%= tableHeader %>
 <%
-  int infoPort = master.getServerManager().getHServerInfo(rootLocation).getInfoPort();
-  String url = "http://" + rootLocation.getHostname() + ":" + infoPort + "/";
+  int infoPort = master.getServerManager().getHServerInfo(rl).getInfoPort();
+  String url = "http://" + rl.getHostname() + ":" + infoPort + "/";
 %>
 <tr>
   <td><%= tableName %></td>
-  <td><a href="<%= url %>"><%= rootLocation.getHostname() %>:<%= rootLocation.getPort() %></a></td>
+  <td><a href="<%= url %>"><%= rl.getHostname() %>:<%= rl.getPort() %></a></td>
   <td>-</td>
   <td></td>
   <td>-</td>
@@ -100,14 +97,16 @@
 %>
 <%= tableHeader %>
 <%
-  Map<byte [], MetaRegion> onlineRegions = master.getRegionManager().getOnlineMetaRegions();
-  for (MetaRegion meta: onlineRegions.values()) {
-    int infoPort = master.getServerManager().getHServerInfo(meta.getServer()).getInfoPort();
-    String url = "http://" + meta.getServer().getHostname() + ":" + infoPort + "/";
+  // NOTE: Presumes one meta region only.
+  HRegionInfo meta = HRegionInfo.FIRST_META_REGIONINFO;
+  HServerAddress metaLocation = master.getCatalogTracker().getMetaLocation();
+  for (int i = 0; i < 1; i++) {
+    int infoPort = master.getServerManager().getHServerInfo(metaLocation).getInfoPort();
+    String url = "http://" + metaLocation.getHostname() + ":" + infoPort + "/";
 %>
 <tr>
-  <td><%= Bytes.toString(meta.getRegionName()) %></td>
-    <td><a href="<%= url %>"><%= meta.getServer().getHostname().toString() + ":" + infoPort %></a></td>
+  <td><%= meta.getRegionNameAsString() %></td>
+    <td><a href="<%= url %>"><%= metaLocation.getHostname().toString() + ":" + infoPort %></a></td>
     <td>-</td><td><%= Bytes.toString(meta.getStartKey()) %></td><td><%= Bytes.toString(meta.getEndKey()) %></td>
 </tr>
 <%  } %>
@@ -139,21 +138,44 @@
 <%=     tableHeader %>
 <%
   for(Map.Entry<HRegionInfo, HServerAddress> hriEntry : regions.entrySet()) {
-    int infoPort = master.getServerManager().getHServerInfo(hriEntry.getValue()).getInfoPort();
-    String urlRegionServer =
-        "http://" + hriEntry.getValue().getHostname().toString() + ":" + infoPort + "/";
+    HRegionInfo regionInfo = hriEntry.getKey();
+    HServerAddress addr = hriEntry.getValue();
+
+    int infoPort = 0;
+    String urlRegionServer = null;
+
+    if (addr != null) {
+      HServerInfo info = master.getServerManager().getHServerInfo(addr);
+      if (info != null) {
+        infoPort = info.getInfoPort();
+        urlRegionServer =
+            "http://" + addr.getHostname().toString() + ":" + infoPort + "/";
+      }
+    }
 %>
 <tr>
-  <td><%= Bytes.toStringBinary(hriEntry.getKey().getRegionName())%></td>
-  <td><a href="<%= urlRegionServer %>"><%= hriEntry.getValue().getHostname().toString() + ":" + infoPort %></a></td>
-  <td><%= Bytes.toStringBinary(hriEntry.getKey().getStartKey())%></td>
-  <td><%= Bytes.toStringBinary(hriEntry.getKey().getEndKey())%></td>
+  <td><%= Bytes.toStringBinary(regionInfo.getRegionName())%></td>
+  <%
+  if (urlRegionServer != null) {
+  %>
+  <td>
+    <a href="<%= urlRegionServer %>"><%= addr.getHostname().toString() + ":" + infoPort %></a>
+  </td>
+  <%
+  } else {
+  %>
+  <td class="undeployed-region">not deployed</td>
+  <%
+  }
+  %>
+  <td><%= Bytes.toStringBinary(regionInfo.getStartKey())%></td>
+  <td><%= Bytes.toStringBinary(regionInfo.getEndKey())%></td>
 </tr>
 <% } %>
 </table>
 <% }
 } catch(Exception ex) {
-  ex.printStackTrace();
+  ex.printStackTrace(System.err);
 }
 } // end else
 %>

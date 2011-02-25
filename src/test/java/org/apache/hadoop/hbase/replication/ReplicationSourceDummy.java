@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.replication;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceInterface;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceManager;
 
@@ -39,7 +40,7 @@ public class ReplicationSourceDummy implements ReplicationSourceInterface {
 
   @Override
   public void init(Configuration conf, FileSystem fs,
-                   ReplicationSourceManager manager, AtomicBoolean stopper,
+                   ReplicationSourceManager manager, Stoppable stopper,
                    AtomicBoolean replicating, String peerClusterId)
       throws IOException {
     this.manager = manager;
@@ -62,7 +63,12 @@ public class ReplicationSourceDummy implements ReplicationSourceInterface {
   }
 
   @Override
-  public void terminate() {
+  public void terminate(String reason) {
+
+  }
+
+  @Override
+  public void terminate(String reason, Exception e) {
 
   }
 
@@ -70,4 +76,15 @@ public class ReplicationSourceDummy implements ReplicationSourceInterface {
   public String getPeerClusterZnode() {
     return peerClusterId;
   }
+
+  @Override
+  public String getPeerClusterId() {
+    return peerClusterId;
+  }
+
+  @Override
+  public void setSourceEnabled(boolean status) {
+
+  }
+
 }

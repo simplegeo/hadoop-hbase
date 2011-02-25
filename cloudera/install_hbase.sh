@@ -97,30 +97,28 @@ install -d -m 0755 $PREFIX/$MAN_DIR
 
 gzip -c $CLOUDERA_SOURCE_DIR/hbase.1 > $PREFIX/$MAN_DIR/hbase.1.gz
 cp -ra lib/* ${PREFIX}/${LIB_DIR}/lib/
-cp -a cloudera ${PREFIX}/${LIB_DIR}/cloudera
-cp hbase*.jar $PREFIX/$LIB_DIR/
-
-# Make an unversioned jar symlink so that other
-# packages that depend on us can link in.
-for x in $PREFIX/$LIB_DIR/hbase*jar ; do
-  JARNAME=$(basename $x)
-  VERSIONLESS_NAME=$(echo $JARNAME | sed -e 's,hbase-[0-9\+\-\.]*[0-9]\(-SNAPSHOT\)*,hbase,g')
-  ln -s $JARNAME $PREFIX/$LIB_DIR/$VERSIONLESS_NAME
-done
+cp hbase*.jar $PREFIX/$LIB_DIR
 cp -a docs/* $PREFIX/$DOC_DIR
 cp *.txt $PREFIX/$DOC_DIR/
 cp -a hbase-webapps $PREFIX/$LIB_DIR
 
 cp -a conf $PREFIX/$ETC_DIR/conf
-cp -a bin/* $PREFIX/$BIN_DIR/
+cp -a bin/* $PREFIX/$BIN_DIR
 
 ln -s $ETC_DIR/conf $PREFIX/$LIB_DIR/conf
 
-install -d -m 0755 $PREFIX/usr/bin
- 
 wrapper=$PREFIX/usr/bin/hbase
+mkdir -p `dirname $wrapper`
 cat > $wrapper <<EOF
 #!/bin/sh
+export ZOOKEEPER_CONF=\${ZOOKEEPER_CONF:-/etc/zookeeper}
+export HADOOP_CONF=\${HADOOP_CONF:-/etc/hadoop-0.20/conf}
+export ZOOKEEPER_HOME=\${ZOOKEEPER_HOME:-/usr/lib/zookeeper}
+export HADOOP_HOME=\${HADOOP_HOME:-/usr/lib/hadoop-0.20}
+export HBASE_CLASSPATH=\$ZOOKEEPER_CONF:\$HADOOP_CONF:\$HADOOP_HOME/*:\$HADOOP_HOME/lib/*:\$ZOOKEEPER_HOME/*:\$ZOOKEEPER_HOME/lib/*:\$HBASE_CLASSPATH
+export HBASE_PID_DIR=/var/run/hbase
 exec /usr/lib/hbase/bin/hbase "\$@"
 EOF
 chmod 755 $wrapper
+
+install -d -m 0755 $PREFIX/usr/bin

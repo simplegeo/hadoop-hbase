@@ -20,6 +20,7 @@
 package org.apache.hadoop.hbase.regionserver;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -89,8 +90,16 @@ public class Store implements HeapSize {
   // ttl in milliseconds.
   protected long ttl;
   private long majorCompactionTime;
-  private int maxFilesToCompact;
+  private final int maxFilesToCompact;
+  private final long minCompactSize;
+  // compactRatio: double on purpose!  Float.MAX < Long.MAX < Double.MAX
+  // With float, java will downcast your long to float for comparisons (bad)
+  private double compactRatio;
+  private long lastCompactSize = 0;
+  /* how many bytes to write between status checks */
+  static int closeCheckInterval = 0;
   private final long desiredMaxFileSize;
+  private final int blockingStoreFileCount;
   private volatile long storeSize = 0L;
   private final Object flushLock = new Object();
   final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
@@ -112,7 +121,10 @@ public class Store implements HeapSize {
   private final int compactionThreshold;
   private final int blocksize;
   private final boolean blockcache;
+  /** Compression algorithm for flush files and minor compaction */
   private final Compression.Algorithm compression;
+  /** Compression algorithm for major compaction */
+  private final Compression.Algorithm compactionCompression;
 
   // Comparing KeyValues
   final KeyValue.KVComparator comparator;
@@ -144,6 +156,11 @@ public class Store implements HeapSize {
     this.blockcache = family.isBlockCacheEnabled();
     this.blocksize = family.getBlocksize();
     this.compression = family.getCompression();
+    // avoid overriding compression setting for major compactions if the user
+    // has not specified it separately
+    this.compactionCompression =
+      (family.getCompactionCompression() != Compression.Algorithm.NONE) ?
+        family.getCompactionCompression() : this.compression;
     this.comparator = info.getComparator();
     // getTimeToLive returns ttl in seconds.  Convert to milliseconds.
     this.ttl = family.getTimeToLive();
@@ -156,13 +173,13 @@ public class Store implements HeapSize {
       // second -> ms adjust for user data
       this.ttl *= 1000;
     }
-    this.memstore = new MemStore(this.comparator);
+    this.memstore = new MemStore(conf, this.comparator);
     this.storeNameStr = Bytes.toString(this.family.getName());
 
     // By default, we compact if an HStore has more than
     // MIN_COMMITS_FOR_COMPACTION map files
-    this.compactionThreshold =
-      conf.getInt("hbase.hstore.compactionThreshold", 3);
+    this.compactionThreshold = Math.max(2,
+      conf.getInt("hbase.hstore.compactionThreshold", 3));
 
     // Check if this is in-memory store
     this.inMemory = family.isInMemory();
@@ -174,17 +191,21 @@ public class Store implements HeapSize {
         HConstants.DEFAULT_MAX_FILE_SIZE);
     }
     this.desiredMaxFileSize = maxFileSize;
+    this.blockingStoreFileCount =
+      conf.getInt("hbase.hstore.blockingStoreFiles", 7);
 
-    this.majorCompactionTime =
-      conf.getLong(HConstants.MAJOR_COMPACTION_PERIOD, 86400000);
-    if (family.getValue(HConstants.MAJOR_COMPACTION_PERIOD) != null) {
-      String strCompactionTime =
-        family.getValue(HConstants.MAJOR_COMPACTION_PERIOD);
-      this.majorCompactionTime = (new Long(strCompactionTime)).longValue();
-    }
+    this.majorCompactionTime = getNextMajorCompactTime();
 
     this.maxFilesToCompact = conf.getInt("hbase.hstore.compaction.max", 10);
-    this.storefiles = ImmutableList.copyOf(loadStoreFiles());
+    this.minCompactSize = conf.getLong("hbase.hstore.compaction.min.size",
+        this.region.memstoreFlushSize);
+    this.compactRatio = conf.getFloat("hbase.hstore.compaction.ratio", 1.2F);
+
+    if (Store.closeCheckInterval == 0) {
+      Store.closeCheckInterval = conf.getInt(
+          "hbase.hstore.close.check.interval", 10*1000*1000 /* 10 MB */);
+    }
+    this.storefiles = sortAndClone(loadStoreFiles());
   }
 
   public HColumnDescriptor getFamily() {
@@ -219,7 +240,7 @@ public class Store implements HeapSize {
   }
 
   /*
-   * Creates a series of StoreFile loaded from the given directory.
+   * Creates an unsorted list of StoreFile loaded from the given directory.
    * @throws IOException
    */
   private List<StoreFile> loadStoreFiles()
@@ -256,7 +277,6 @@ public class Store implements HeapSize {
       }
       results.add(curfile);
     }
-    Collections.sort(results, StoreFile.Comparators.FLUSH_TIME);
     return results;
   }
 
@@ -357,7 +377,7 @@ public class Store implements HeapSize {
     try {
       ArrayList<StoreFile> newFiles = new ArrayList<StoreFile>(storefiles);
       newFiles.add(sf);
-      this.storefiles = ImmutableList.copyOf(newFiles);
+      this.storefiles = sortAndClone(newFiles);
       notifyChangedReadersObservers();
     } finally {
       this.lock.writeLock().unlock();
@@ -415,6 +435,7 @@ public class Store implements HeapSize {
    * previously.
    * @param logCacheFlushId flush sequence number
    * @param snapshot
+   * @param snapshotTimeRangeTracker
    * @return true if a compaction is needed
    * @throws IOException
    */
@@ -471,7 +492,9 @@ public class Store implements HeapSize {
     // Write-out finished successfully, move into the right spot
     Path dstPath = StoreFile.getUniqueFile(fs, homedir);
     LOG.info("Renaming flushed file at " + writer.getPath() + " to " + dstPath);
-    fs.rename(writer.getPath(), dstPath);
+    if (!fs.rename(writer.getPath(), dstPath)) {
+      LOG.warn("Unable to rename " + writer.getPath() + " to " + dstPath);
+    }
 
     StoreFile sf = new StoreFile(this.fs, dstPath, blockcache,
       this.conf, this.family.getBloomFilterType(), this.inMemory);
@@ -481,19 +504,30 @@ public class Store implements HeapSize {
       LOG.info("Added " + sf + ", entries=" + r.getEntries() +
         ", sequenceid=" + logCacheFlushId +
         ", memsize=" + StringUtils.humanReadableInt(flushed) +
-        ", filesize=" + StringUtils.humanReadableInt(r.length()) +
-        " to " + this.region.regionInfo.getRegionNameAsString());
+        ", filesize=" + StringUtils.humanReadableInt(r.length()));
     }
     return sf;
   }
 
   /*
+   * @param maxKeyCount
    * @return Writer for a new StoreFile in the tmp dir.
    */
   private StoreFile.Writer createWriterInTmp(int maxKeyCount)
   throws IOException {
+    return createWriterInTmp(maxKeyCount, this.compression);
+  }
+
+  /*
+   * @param maxKeyCount
+   * @param compression Compression algorithm to use
+   * @return Writer for a new StoreFile in the tmp dir.
+   */
+  private StoreFile.Writer createWriterInTmp(int maxKeyCount,
+    Compression.Algorithm compression)
+  throws IOException {
     return StoreFile.createWriter(this.fs, region.getTmpDir(), this.blocksize,
-        this.compression, this.comparator, this.conf,
+        compression, this.comparator, this.conf,
         this.family.getBloomFilterType(), maxKeyCount);
   }
 
@@ -511,7 +545,7 @@ public class Store implements HeapSize {
     try {
       ArrayList<StoreFile> newList = new ArrayList<StoreFile>(storefiles);
       newList.add(sf);
-      storefiles = ImmutableList.copyOf(newList);
+      storefiles = sortAndClone(newList);
       this.memstore.clearSnapshot(set);
 
       // Tell listeners of the change in readers.
@@ -544,9 +578,8 @@ public class Store implements HeapSize {
    * @param o Observer no longer interested in changes in set of Readers.
    */
   void deleteChangedReaderObserver(ChangedReadersObserver o) {
-    if (!this.changedReaderObservers.remove(o)) {
-      LOG.warn("Not in set" + o);
-    }
+    // We don't check if observer present; it may not be (legitimately)
+    this.changedReaderObservers.remove(o);
   }
 
   //////////////////////////////////////////////////////////////////////////////
@@ -569,23 +602,22 @@ public class Store implements HeapSize {
    * <p>We don't want to hold the structureLock for the whole time, as a compact()
    * can be lengthy and we want to allow cache-flushes during this period.
    *
-   * @param mc True to force a major compaction regardless of thresholds
+   * @param forceMajor True to force a major compaction regardless of thresholds
    * @return row to split around if a split is needed, null otherwise
    * @throws IOException
    */
-  StoreSize compact(final boolean mc) throws IOException {
+  StoreSize compact(final boolean forceMajor) throws IOException {
     boolean forceSplit = this.region.shouldSplit(false);
-    boolean majorcompaction = mc;
+    boolean majorcompaction = forceMajor;
     synchronized (compactLock) {
+      this.lastCompactSize = 0;
+
       // filesToCompact are sorted oldest to newest.
       List<StoreFile> filesToCompact = this.storefiles;
       if (filesToCompact.isEmpty()) {
         LOG.debug(this.storeNameStr + ": no store files to compact");
         return null;
       }
-
-      // Max-sequenceID is the last key of the storefiles TreeMap
-      long maxId = StoreFile.getMaxSequenceIdInList(storefiles);
 
       // Check to see if we need to do a major compaction on this region.
       // If so, change doMajorCompaction to true to skip the incremental
@@ -600,85 +632,138 @@ public class Store implements HeapSize {
         return checkSplit(forceSplit);
       }
 
-      // HBASE-745, preparing all store file sizes for incremental compacting
-      // selection.
+      /* get store file sizes for incremental compacting selection.
+       * normal skew:
+       *
+       *         older ----> newer
+       *     _
+       *    | |   _
+       *    | |  | |   _
+       *  --|-|- |-|- |-|---_-------_-------  minCompactSize
+       *    | |  | |  | |  | |  _  | |
+       *    | |  | |  | |  | | | | | |
+       *    | |  | |  | |  | | | | | |
+       */
       int countOfFiles = filesToCompact.size();
-      long totalSize = 0;
       long [] fileSizes = new long[countOfFiles];
-      long skipped = 0;
-      int point = 0;
-      for (int i = 0; i < countOfFiles; i++) {
+      long [] sumSize = new long[countOfFiles];
+      for (int i = countOfFiles-1; i >= 0; --i) {
         StoreFile file = filesToCompact.get(i);
         Path path = file.getPath();
         if (path == null) {
-          LOG.warn("Path is null for " + file);
+          LOG.error("Path is null for " + file);
           return null;
         }
         StoreFile.Reader r = file.getReader();
         if (r == null) {
-          LOG.warn("StoreFile " + file + " has a null Reader");
+          LOG.error("StoreFile " + file + " has a null Reader");
           return null;
         }
-        long len = file.getReader().length();
-        fileSizes[i] = len;
-        totalSize += len;
+        fileSizes[i] = file.getReader().length();
+        // calculate the sum of fileSizes[i,i+maxFilesToCompact-1) for algo
+        int tooFar = i + this.maxFilesToCompact - 1;
+        sumSize[i] = fileSizes[i]
+                   + ((i+1    < countOfFiles) ? sumSize[i+1]      : 0)
+                   - ((tooFar < countOfFiles) ? fileSizes[tooFar] : 0);
       }
 
+      long totalSize = 0;
       if (!majorcompaction && !references) {
-        // Here we select files for incremental compaction.
-        // The rule is: if the largest(oldest) one is more than twice the
-        // size of the second, skip the largest, and continue to next...,
-        // until we meet the compactionThreshold limit.
+        // we're doing a minor compaction, let's see what files are applicable
+        int start = 0;
+        double r = this.compactRatio;
 
-        // A problem with the above heuristic is that we could go through all of
-        // filesToCompact and the above condition could hold for all files and
-        // we'd end up with nothing to compact.  To protect against this, we'll
-        // compact the tail -- up to the last 4 files -- of filesToCompact
-        // regardless.
-        // BANDAID for HBASE-2990, setting to 2
-        int tail = Math.min(countOfFiles, 2);
-        for (point = 0; point < (countOfFiles - tail); point++) {
-          if (((fileSizes[point] < fileSizes[point + 1] * 2) &&
-               (countOfFiles - point) <= maxFilesToCompact)) {
-            break;
-          }
-          skipped += fileSizes[point];
+        /* Start at the oldest file and stop when you find the first file that
+         * meets compaction criteria:
+         *   (1) a recently-flushed, small file (i.e. <= minCompactSize)
+         *      OR
+         *   (2) within the compactRatio of sum(newer_files)
+         * Given normal skew, any newer files will also meet this criteria
+         *
+         * Additional Note:
+         * If fileSizes.size() >> maxFilesToCompact, we will recurse on
+         * compact().  Consider the oldest files first to avoid a
+         * situation where we always compact [end-threshold,end).  Then, the
+         * last file becomes an aggregate of the previous compactions.
+         */
+        while(countOfFiles - start >= this.compactionThreshold &&
+              fileSizes[start] >
+                Math.max(minCompactSize, (long)(sumSize[start+1] * r))) {
+          ++start;
         }
-        filesToCompact = new ArrayList<StoreFile>(filesToCompact.subList(point,
-          countOfFiles));
-        if (filesToCompact.size() <= 1) {
+        int end = Math.min(countOfFiles, start + this.maxFilesToCompact);
+        totalSize = fileSizes[start]
+                  + ((start+1 < countOfFiles) ? sumSize[start+1] : 0);
+
+        // if we don't have enough files to compact, just wait
+        if (end - start < this.compactionThreshold) {
           if (LOG.isDebugEnabled()) {
-            LOG.debug("Skipped compaction of 1 file; compaction size of " +
-              this.storeNameStr + ": " +
-              StringUtils.humanReadableInt(totalSize) + "; Skipped " + point +
-              " files, size: " + skipped);
+            LOG.debug("Skipped compaction of " + this.storeNameStr
+              + " because only " + (end - start) + " file(s) of size "
+              + StringUtils.humanReadableInt(totalSize)
+              + " meet compaction criteria.");
           }
           return checkSplit(forceSplit);
         }
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Compaction size of " + this.storeNameStr + ": " +
-            StringUtils.humanReadableInt(totalSize) + "; Skipped " + point +
-            " file(s), size: " + skipped);
+
+        if (0 == start && end == countOfFiles) {
+          // we decided all the files were candidates! major compact
+          majorcompaction = true;
+        } else {
+          filesToCompact = new ArrayList<StoreFile>(filesToCompact.subList(start,
+            end));
+        }
+      } else {
+        // all files included in this compaction
+        for (long i : fileSizes) {
+          totalSize += i;
         }
       }
+      this.lastCompactSize = totalSize;
+
+      // Max-sequenceID is the last key in the files we're compacting
+      long maxId = StoreFile.getMaxSequenceIdInList(filesToCompact);
 
       // Ready to go.  Have list of files to compact.
-      LOG.info("Started compaction of " + filesToCompact.size() + " file(s) in " +
-          this.storeNameStr + " of " + this.region.getRegionInfo().getRegionNameAsString() +
+      LOG.info("Started compaction of " + filesToCompact.size() + " file(s) in cf=" +
+          this.storeNameStr +
         (references? ", hasReferences=true,": " ") + " into " +
-          region.getTmpDir() + ", sequenceid=" + maxId);
+          region.getTmpDir() + ", seqid=" + maxId +
+          ", totalSize=" + StringUtils.humanReadableInt(totalSize));
       StoreFile.Writer writer = compact(filesToCompact, majorcompaction, maxId);
       // Move the compaction into place.
       StoreFile sf = completeCompaction(filesToCompact, writer);
       if (LOG.isInfoEnabled()) {
         LOG.info("Completed" + (majorcompaction? " major ": " ") +
-          "compaction of " + filesToCompact.size() + " file(s) in " +
-          this.storeNameStr + " of " + this.region.getRegionInfo().getRegionNameAsString() +
-          "; new storefile is " + (sf == null? "none": sf.toString()) +
-          "; store size is " + StringUtils.humanReadableInt(storeSize));
+          "compaction of " + filesToCompact.size() +
+          " file(s), new file=" + (sf == null? "none": sf.toString()) +
+          ", size=" + (sf == null? "none": StringUtils.humanReadableInt(sf.getReader().length())) +
+          "; total size for store is " + StringUtils.humanReadableInt(storeSize));
       }
     }
     return checkSplit(forceSplit);
+  }
+
+  /*
+   * Compact the most recent N files. Essentially a hook for testing.
+   */
+  protected void compactRecent(int N) throws IOException {
+    synchronized(compactLock) {
+      List<StoreFile> filesToCompact = this.storefiles;
+      int count = filesToCompact.size();
+      if (N > count) {
+        throw new RuntimeException("Not enough files");
+      }
+
+      filesToCompact = new ArrayList<StoreFile>(filesToCompact.subList(count-N, count));
+      long maxId = StoreFile.getMaxSequenceIdInList(filesToCompact);
+      boolean majorcompaction = (N == count);
+
+      // Ready to go.  Have list of files to compact.
+      StoreFile.Writer writer = compact(filesToCompact, majorcompaction, maxId);
+      // Move the compaction into place.
+      StoreFile sf = completeCompaction(filesToCompact, writer);
+    }
   }
 
   /*
@@ -735,19 +820,26 @@ public class Store implements HeapSize {
         majorCompactionTime == 0) {
       return result;
     }
+    // TODO: Use better method for determining stamp of last major (HBASE-2990)
     long lowTimestamp = getLowestTimestamp(fs,
       filesToCompact.get(0).getPath().getParent());
     long now = System.currentTimeMillis();
     if (lowTimestamp > 0l && lowTimestamp < (now - this.majorCompactionTime)) {
       // Major compaction time has elapsed.
-      long elapsedTime = now - lowTimestamp;
-      if (filesToCompact.size() == 1 &&
-          filesToCompact.get(0).isMajorCompaction() &&
-          (this.ttl == HConstants.FOREVER || elapsedTime < this.ttl)) {
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Skipping major compaction of " + this.storeNameStr +
-            " because one (major) compacted file only and elapsedTime " +
-            elapsedTime + "ms is < ttl=" + this.ttl);
+      if (filesToCompact.size() == 1) {
+        // Single file
+        StoreFile sf = filesToCompact.get(0);
+        long oldest =
+            (sf.getReader().timeRangeTracker == null) ?
+                Long.MIN_VALUE :
+                now - sf.getReader().timeRangeTracker.minimumTimestamp;
+        if (sf.isMajorCompaction() &&
+            (this.ttl == HConstants.FOREVER || oldest < this.ttl)) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Skipping major compaction of " + this.storeNameStr +
+                " because one (major) compacted file only and oldestTime " +
+                oldest + "ms is < ttl=" + this.ttl);
+          }
         }
       } else {
         if (LOG.isDebugEnabled()) {
@@ -755,9 +847,31 @@ public class Store implements HeapSize {
             "; time since last major compaction " + (now - lowTimestamp) + "ms");
         }
         result = true;
+        this.majorCompactionTime = getNextMajorCompactTime();
       }
     }
     return result;
+  }
+
+  long getNextMajorCompactTime() {
+    // default = 24hrs
+    long ret = conf.getLong(HConstants.MAJOR_COMPACTION_PERIOD, 1000*60*60*24);
+    if (family.getValue(HConstants.MAJOR_COMPACTION_PERIOD) != null) {
+      String strCompactionTime =
+        family.getValue(HConstants.MAJOR_COMPACTION_PERIOD);
+      ret = (new Long(strCompactionTime)).longValue();
+    }
+
+    if (ret > 0) {
+      // default = 20% = +/- 4.8 hrs
+      double jitterPct =  conf.getFloat("hbase.hregion.majorcompaction.jitter",
+          0.20F);
+      if (jitterPct > 0) {
+        long jitter = Math.round(ret * jitterPct);
+        ret += jitter - Math.round(2L * jitter * Math.random());
+      }
+    }
+    return ret;
   }
 
   /**
@@ -780,8 +894,15 @@ public class Store implements HeapSize {
       if (r != null) {
         // NOTE: getFilterEntries could cause under-sized blooms if the user
         //       switches bloom type (e.g. from ROW to ROWCOL)
-        maxKeyCount += (r.getBloomFilterType() == family.getBloomFilterType())
+        long keyCount = (r.getBloomFilterType() == family.getBloomFilterType())
           ? r.getFilterEntries() : r.getEntries();
+        maxKeyCount += keyCount;
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Compacting " + file +
+            ", keycount=" + keyCount +
+            ", bloomtype=" + r.getBloomFilterType().toString() +
+            ", size=" + StringUtils.humanReadableInt(r.length()) );
+        }
       }
     }
 
@@ -793,22 +914,42 @@ public class Store implements HeapSize {
     // where all source cells are expired or deleted.
     StoreFile.Writer writer = null;
     try {
-    if (majorCompaction) {
       InternalScanner scanner = null;
       try {
         Scan scan = new Scan();
         scan.setMaxVersions(family.getMaxVersions());
-        scanner = new StoreScanner(this, scan, scanners);
+        /* include deletes, unless we are doing a major compaction */
+        scanner = new StoreScanner(this, scan, scanners, !majorCompaction);
+        int bytesWritten = 0;
         // since scanner.next() can return 'false' but still be delivering data,
         // we have to use a do/while loop.
         ArrayList<KeyValue> kvs = new ArrayList<KeyValue>();
         while (scanner.next(kvs)) {
-          // output to writer:
-          for (KeyValue kv : kvs) {
-            if (writer == null) {
-              writer = createWriterInTmp(maxKeyCount);
+          if (writer == null && !kvs.isEmpty()) {
+            writer = createWriterInTmp(maxKeyCount,
+              this.compactionCompression);
+          }
+          if (writer != null) {
+            // output to writer:
+            for (KeyValue kv : kvs) {
+              writer.append(kv);
+
+              // check periodically to see if a system stop is requested
+              if (Store.closeCheckInterval > 0) {
+                bytesWritten += kv.getLength();
+                if (bytesWritten > Store.closeCheckInterval) {
+                  bytesWritten = 0;
+                  if (!this.region.areWritesEnabled()) {
+                    writer.close();
+                    fs.delete(writer.getPath(), false);
+                    throw new InterruptedIOException(
+                        "Aborting compaction of store " + this +
+                        " in region " + this.region +
+                        " because user requested stop.");
+                  }
+                }
+              }
             }
-            writer.append(kv);
           }
           kvs.clear();
         }
@@ -817,19 +958,6 @@ public class Store implements HeapSize {
           scanner.close();
         }
       }
-    } else {
-      MinorCompactingStoreScanner scanner = null;
-      try {
-        scanner = new MinorCompactingStoreScanner(this, scanners);
-        writer = createWriterInTmp(maxKeyCount);
-        while (scanner.next(writer)) {
-          // Nothing to do
-        }
-      } finally {
-        if (scanner != null)
-          scanner.close();
-      }
-    }
     } finally {
       if (writer != null) {
         writer.appendMetadata(maxId, majorCompaction);
@@ -901,7 +1029,7 @@ public class Store implements HeapSize {
           newStoreFiles.add(result);
         }
 
-	this.storefiles = ImmutableList.copyOf(newStoreFiles);
+        this.storefiles = sortAndClone(newStoreFiles);
 
         // Tell observers that list of StoreFiles has changed.
         notifyChangedReadersObservers();
@@ -930,6 +1058,12 @@ public class Store implements HeapSize {
       this.lock.writeLock().unlock();
     }
     return result;
+  }
+
+  public ImmutableList<StoreFile> sortAndClone(List<StoreFile> storeFiles) {
+    Collections.sort(storeFiles, StoreFile.Comparators.FLUSH_TIME);
+    ImmutableList<StoreFile> newList = ImmutableList.copyOf(storeFiles);
+    return newList;
   }
 
   // ////////////////////////////////////////////////////////////////////////////
@@ -1182,6 +1316,11 @@ public class Store implements HeapSize {
     return null;
   }
 
+  /** @return aggregate size of all HStores used in the last compaction */
+  public long getLastCompactSize() {
+    return this.lastCompactSize;
+  }
+
   /** @return aggregate size of HStore */
   public long getSize() {
     return storeSize;
@@ -1250,6 +1389,13 @@ public class Store implements HeapSize {
   }
 
   /**
+   * @return The priority that this store should have in the compaction queue
+   */
+  int getCompactPriority() {
+    return this.blockingStoreFileCount - this.storefiles.size();
+  }
+
+  /**
    * Datastructure that holds size and row to split a file around.
    * TODO: Take a KeyValue rather than row.
    */
@@ -1312,6 +1458,30 @@ public class Store implements HeapSize {
     }
   }
 
+  /**
+   * Adds or replaces the specified KeyValues.
+   * <p>
+   * For each KeyValue specified, if a cell with the same row, family, and
+   * qualifier exists in MemStore, it will be replaced.  Otherwise, it will just
+   * be inserted to MemStore.
+   * <p>
+   * This operation is atomic on each KeyValue (row/family/qualifier) but not
+   * necessarily atomic across all of them.
+   * @param kvs
+   * @return memstore size delta
+   * @throws IOException
+   */
+  public long upsert(List<KeyValue> kvs)
+      throws IOException {
+    this.lock.readLock().lock();
+    try {
+      // TODO: Make this operation atomic w/ RWCC
+      return this.memstore.upsert(kvs);
+    } finally {
+      this.lock.readLock().unlock();
+    }
+  }
+
   public StoreFlusher getStoreFlusher(long cacheFlushId) {
     return new StoreFlusherImpl(cacheFlushId);
   }
@@ -1360,8 +1530,9 @@ public class Store implements HeapSize {
   }
 
   public static final long FIXED_OVERHEAD = ClassSize.align(
-      ClassSize.OBJECT + (14 * ClassSize.REFERENCE) +
-      (4 * Bytes.SIZEOF_LONG) + (3 * Bytes.SIZEOF_INT) + (Bytes.SIZEOF_BOOLEAN * 2));
+      ClassSize.OBJECT + (15 * ClassSize.REFERENCE) +
+      (6 * Bytes.SIZEOF_LONG) + (1 * Bytes.SIZEOF_DOUBLE) +
+      (4 * Bytes.SIZEOF_INT) + (Bytes.SIZEOF_BOOLEAN * 2));
 
   public static final long DEEP_OVERHEAD = ClassSize.align(FIXED_OVERHEAD +
       ClassSize.OBJECT + ClassSize.REENTRANT_LOCK +

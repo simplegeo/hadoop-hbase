@@ -31,13 +31,13 @@ import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.Stoppable;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * This class is responsible for replicating the edits coming
@@ -61,8 +61,8 @@ public class ReplicationSink {
   private final Configuration conf;
   // Pool used to replicated
   private final HTablePool pool;
-  // boolean coming from HRS to know when the process stops
-  private final AtomicBoolean stop;
+  // Chain to pull on when we want all to stop.
+  private final Stoppable stopper;
   private final ReplicationSinkMetrics metrics;
 
   /**
@@ -72,12 +72,12 @@ public class ReplicationSink {
    * @param stopper             boolean to tell this thread to stop
    * @throws IOException thrown when HDFS goes bad or bad file name
    */
-  public ReplicationSink(Configuration conf, AtomicBoolean stopper)
+  public ReplicationSink(Configuration conf, Stoppable stopper)
       throws IOException {
     this.conf = conf;
     this.pool = new HTablePool(this.conf,
         conf.getInt("replication.sink.htablepool.capacity", 10));
-    this.stop = stopper;
+    this.stopper = stopper;
     this.metrics = new ReplicationSinkMetrics();
   }
 
@@ -146,21 +146,8 @@ public class ReplicationSink {
       this.metrics.appliedBatchesRate.inc(1);
       LOG.info("Total replicated: " + totalReplicated);
     } catch (IOException ex) {
-      if (ex.getCause() instanceof TableNotFoundException) {
-        LOG.warn("Losing edits because: ", ex);
-      } else {
-        // Should we log rejected edits in a file for replay?
-        LOG.error("Unable to accept edit because", ex);
-        this.stop.set(true);
-        throw ex;
-      }
-    } catch (RuntimeException re) {
-      if (re.getCause() instanceof TableNotFoundException) {
-        LOG.warn("Losing edits because: ", re);
-      } else {
-        this.stop.set(true);
-        throw re;
-      }
+      LOG.error("Unable to accept edit because:", ex);
+      throw ex;
     }
   }
 

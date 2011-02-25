@@ -60,12 +60,13 @@ import java.util.TreeSet;
  * <p>
  * To add a filter, execute {@link #setFilter(Filter) setFilter}.
  */
-public class Get implements Writable {
+public class Get implements Writable, Row, Comparable<Row> {
   private static final byte GET_VERSION = (byte)1;
 
   private byte [] row = null;
   private long lockId = -1L;
   private int maxVersions = 1;
+  private boolean cacheBlocks = true;
   private Filter filter = null;
   private TimeRange tr = new TimeRange();
   private Map<byte [], NavigableSet<byte []>> familyMap =
@@ -204,6 +205,29 @@ public class Get implements Writable {
   }
 
   /**
+   * Set whether blocks should be cached for this Get.
+   * <p>
+   * This is true by default.  When true, default settings of the table and
+   * family are used (this will never override caching blocks if the block
+   * cache is disabled for that family or entirely).
+   *
+   * @param cacheBlocks if false, default settings are overridden and blocks
+   * will not be cached
+   */
+  public void setCacheBlocks(boolean cacheBlocks) {
+    this.cacheBlocks = cacheBlocks;
+  }
+
+  /**
+   * Get whether blocks should be cached for this Get.
+   * @return true if default caching should be used, false if blocks should not
+   * be cached
+   */
+  public boolean getCacheBlocks() {
+    return cacheBlocks;
+  }
+
+  /**
    * Method for retrieving the get's row
    * @return row
    */
@@ -285,6 +309,8 @@ public class Get implements Writable {
     sb.append(Bytes.toString(this.row));
     sb.append(", maxVersions=");
     sb.append("").append(this.maxVersions);
+    sb.append(", cacheBlocks=");
+    sb.append(this.cacheBlocks);
     sb.append(", timeRange=");
     sb.append("[").append(this.tr.getMin()).append(",");
     sb.append(this.tr.getMax()).append(")");
@@ -325,6 +351,11 @@ public class Get implements Writable {
     return sb.toString();
   }
 
+  //Row
+  public int compareTo(Row other) {
+    return Bytes.compareTo(this.getRow(), other.getRow());
+  }
+  
   //Writable
   public void readFields(final DataInput in)
   throws IOException {
@@ -340,6 +371,7 @@ public class Get implements Writable {
       this.filter = (Filter)createForName(Bytes.toString(Bytes.readByteArray(in)));
       this.filter.readFields(in);
     }
+    this.cacheBlocks = in.readBoolean();
     this.tr = new TimeRange();
     tr.readFields(in);
     int numFamilies = in.readInt();
@@ -374,6 +406,7 @@ public class Get implements Writable {
       Bytes.writeByteArray(out, Bytes.toBytes(filter.getClass().getName()));
       filter.write(out);
     }
+    out.writeBoolean(this.cacheBlocks);
     tr.write(out);
     out.writeInt(familyMap.size());
     for(Map.Entry<byte [], NavigableSet<byte []>> entry :

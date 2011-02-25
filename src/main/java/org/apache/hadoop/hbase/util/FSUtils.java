@@ -36,9 +36,12 @@ import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
+import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;
 import org.apache.hadoop.io.SequenceFile;
 
 import java.io.DataInputStream;
+import java.io.EOFException;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -149,6 +152,8 @@ public class FSUtils {
         fs.open(versionFile);
       try {
         version = DataInputStream.readUTF(s);
+      } catch (EOFException eof) {
+        LOG.warn("Version file was empty, odd, will try to set it.");
       } finally {
         s.close();
       }
@@ -394,7 +399,7 @@ public class FSUtils {
   public static Map<String, Integer> getTableFragmentation(
     final HMaster master)
   throws IOException {
-    Path path = master.getRootDir();
+    Path path = getRootDir(master.getConfiguration());
     // since HMaster.getFileSystem() is package private
     FileSystem fs = path.getFileSystem(master.getConfiguration());
     return getTableFragmentation(fs, path);
@@ -619,7 +624,7 @@ public class FSUtils {
     if (!(fs instanceof DistributedFileSystem)) {
       return;
     }
-    LOG.info("Recovering file" + p);
+    LOG.info("Recovering file " + p);
     long startWaiting = System.currentTimeMillis();
 
     // Trying recovery
@@ -646,6 +651,11 @@ public class FSUtils {
           } catch (InterruptedException ex) {
             // ignore it and try again
           }
+        } else if (e instanceof LeaseExpiredException &&
+            e.getMessage().contains("File does not exist")) {
+          // This exception comes out instead of FNFE, fix it
+          throw new FileNotFoundException(
+              "The given HLog wasn't found at " + p.toString());
         } else {
           throw new IOException("Failed to open " + p + " for append", e);
         }

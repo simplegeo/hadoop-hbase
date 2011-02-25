@@ -31,21 +31,26 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.Server;
+import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.regionserver.wal.WALObserver;
 import org.apache.hadoop.hbase.replication.ReplicationSourceDummy;
-import org.apache.hadoop.hbase.replication.ReplicationZookeeperWrapper;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+import org.apache.hadoop.hbase.zookeeper.ZKUtil;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.Assert.assertEquals;
@@ -59,13 +64,11 @@ public class TestReplicationSourceManager {
 
   private static HBaseTestingUtility utility;
 
-  private static final AtomicBoolean STOPPER = new AtomicBoolean(false);
-
-  private static final AtomicBoolean REPLICATING = new AtomicBoolean(false);
+  private static Replication replication;
 
   private static ReplicationSourceManager manager;
 
-  private static ZooKeeperWrapper zkw;
+  private static ZooKeeperWatcher zkw;
 
   private static HTableDescriptor htd;
 
@@ -98,27 +101,23 @@ public class TestReplicationSourceManager {
     utility = new HBaseTestingUtility(conf);
     utility.startMiniZKCluster();
 
-    zkw = ZooKeeperWrapper.createInstance(conf, "test");
-    zkw.writeZNode("/hbase", "replication", "");
-    zkw.writeZNode("/hbase/replication", "master",
-        conf.get(HConstants.ZOOKEEPER_QUORUM)+":" +
-    conf.get("hbase.zookeeper.property.clientPort")+":/1");
-    zkw.writeZNode("/hbase/replication/peers", "1",
+    zkw = new ZooKeeperWatcher(conf, "test", null);
+    ZKUtil.createWithParents(zkw, "/hbase/replication");
+    ZKUtil.createWithParents(zkw, "/hbase/replication/peers/1");
+    ZKUtil.setData(zkw, "/hbase/replication/peers/1",Bytes.toBytes(
           conf.get(HConstants.ZOOKEEPER_QUORUM)+":" +
-          conf.get("hbase.zookeeper.property.clientPort")+":/1");
+          conf.get("hbase.zookeeper.property.clientPort")+":/1"));
+    ZKUtil.createWithParents(zkw, "/hbase/replication/state");
+    ZKUtil.setData(zkw, "/hbase/replication/state", Bytes.toBytes("true"));
 
-    HRegionServer server = new HRegionServer(conf);
-    ReplicationZookeeperWrapper helper = new ReplicationZookeeperWrapper(
-        server.getZooKeeperWrapper(), conf,
-        REPLICATING, "123456789");
+    replication = new Replication(new DummyServer(), fs, logDir, oldLogDir);
+    manager = replication.getReplicationManager();
     fs = FileSystem.get(conf);
     oldLogDir = new Path(utility.getTestDir(),
         HConstants.HREGION_OLDLOGDIR_NAME);
     logDir = new Path(utility.getTestDir(),
         HConstants.HREGION_LOGDIR_NAME);
 
-    manager = new ReplicationSourceManager(helper,
-        conf, STOPPER, fs, REPLICATING, logDir, oldLogDir);
     manager.addSource("1");
 
     htd = new HTableDescriptor(test);
@@ -160,7 +159,9 @@ public class TestReplicationSourceManager {
     WALEdit edit = new WALEdit();
     edit.add(kv);
 
-    HLog hlog = new HLog(fs, logDir, oldLogDir, conf, null, manager,
+    List<WALObserver> listeners = new ArrayList<WALObserver>();
+    listeners.add(replication);
+    HLog hlog = new HLog(fs, logDir, oldLogDir, conf, listeners,
       URLEncoder.encode("regionserver:60020", "UTF8"));
 
     manager.init();
@@ -204,6 +205,44 @@ public class TestReplicationSourceManager {
 
 
     // TODO Need a case with only 2 HLogs and we only want to delete the first one
+  }
+
+  static class DummyServer implements Server {
+
+    @Override
+    public Configuration getConfiguration() {
+      return conf;
+    }
+
+    @Override
+    public ZooKeeperWatcher getZooKeeper() {
+      return zkw;
+    }
+
+    @Override
+    public CatalogTracker getCatalogTracker() {
+      return null;  //To change body of implemented methods use File | Settings | File Templates.
+    }
+
+    @Override
+    public String getServerName() {
+      return null;  //To change body of implemented methods use File | Settings | File Templates.
+    }
+
+    @Override
+    public void abort(String why, Throwable e) {
+      //To change body of implemented methods use File | Settings | File Templates.
+    }
+
+    @Override
+    public void stop(String why) {
+      //To change body of implemented methods use File | Settings | File Templates.
+    }
+
+    @Override
+    public boolean isStopped() {
+      return false;  //To change body of implemented methods use File | Settings | File Templates.
+    }
   }
 
 }

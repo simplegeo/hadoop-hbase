@@ -19,11 +19,12 @@
  */
 package org.apache.hadoop.hbase.client;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HTableDescriptor;
-
 import java.io.IOException;
 import java.util.List;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.KeyValue;
 
 /**
  * Used to communicate with a single HBase table.
@@ -70,6 +71,30 @@ public interface HTableInterface {
   boolean exists(Get get) throws IOException;
 
   /**
+   * Method that does a batch call on Deletes, Gets and Puts.
+   *
+   * @param actions list of Get, Put, Delete objects
+   * @param results Empty Object[], same size as actions. Provides access to partial
+   *                results, in case an exception is thrown. A null in the result array means that
+   *                the call for that action failed, even after retries
+   * @throws IOException
+   * @since 0.90.0
+   */
+  void batch(final List<Row> actions, final Object[] results) throws IOException, InterruptedException;
+
+  /**
+   * Method that does a batch call on Deletes, Gets and Puts.
+   *
+   *
+   * @param actions list of Get, Put, Delete objects
+   * @return the results from the actions. A null in the return array means that
+   *         the call for that action failed, even after retries
+   * @throws IOException
+   * @since 0.90.0
+   */
+  Object[] batch(final List<Row> actions) throws IOException, InterruptedException;
+
+  /**
    * Extracts certain cells from a given row.
    * @param get The object that specifies what data to fetch and from which row.
    * @return The data coming from the specified row, if it exists.  If the row
@@ -79,6 +104,22 @@ public interface HTableInterface {
    * @since 0.20.0
    */
   Result get(Get get) throws IOException;
+
+  /**
+   * Extracts certain cells from the given rows, in batch.
+   *
+   * @param gets The objects that specify what data to fetch and from which rows.
+   *
+   * @return The data coming from the specified rows, if it exists.  If the row
+   *         specified doesn't exist, the {@link Result} instance returned won't
+   *         contain any {@link KeyValue}, as indicated by {@link Result#isEmpty()}.
+   *         A null in the return array means that the get operation for that
+   *         Get failed, even after retries.
+   * @throws IOException if a remote or network exception occurs.
+   *
+   * @since 0.90.0
+   */
+  Result[] get(List<Get> gets) throws IOException;
 
   /**
    * Return the row that matches <i>row</i> exactly,
@@ -191,7 +232,7 @@ public interface HTableInterface {
 
   /**
    * Atomically checks if a row/family/qualifier value matches the expected
-   * value. If it does, it adds the delete.  If the passed value is null, the 
+   * value. If it does, it adds the delete.  If the passed value is null, the
    * check is for the lack of column (ie: non-existance)
    *
    * @param row to check
@@ -204,6 +245,21 @@ public interface HTableInterface {
    */
   boolean checkAndDelete(byte[] row, byte[] family, byte[] qualifier,
       byte[] value, Delete delete) throws IOException;
+
+  /**
+   * Increments one or more columns within a single row.
+   * <p>
+   * This operation does not appear atomic to readers.  Increments are done
+   * under a single row lock, so write operations to a row are synchronized, but
+   * readers do not take row locks so get and scan operations can see this
+   * operation partially completed.
+   *
+   * @param increment object that specifies the columns and amounts to be used
+   *                  for the increment operations
+   * @throws IOException e
+   * @return values of columns after the increment
+   */
+  public Result increment(final Increment increment) throws IOException;
 
   /**
    * Atomically increments a column value.
@@ -261,7 +317,7 @@ public interface HTableInterface {
    * Executes all the buffered {@link Put} operations.
    * <p>
    * This method gets called once automatically for every {@link Put} or batch
-   * of {@link Put}s (when {@link #put(List<Put>)} is used) when
+   * of {@link Put}s (when <code>put(List<Put>)</code> is used) when
    * {@link #isAutoFlush} is {@code true}.
    * @throws IOException if a remote or network exception occurs.
    */

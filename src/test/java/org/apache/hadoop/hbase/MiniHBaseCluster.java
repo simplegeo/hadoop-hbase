@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase;
 
 import java.io.IOException;
 import java.security.PrivilegedAction;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -34,12 +35,13 @@ import org.apache.hadoop.hbase.client.HConnectionManager;
 import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.JVMClusterUtil;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.io.MapWritable;
-import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.zookeeper.KeeperException;
 
 /**
  * This class creates a single process HBase cluster.
@@ -51,6 +53,7 @@ public class MiniHBaseCluster {
   static final Log LOG = LogFactory.getLog(MiniHBaseCluster.class.getName());
   private Configuration conf;
   public LocalHBaseCluster hbaseCluster;
+  private static int index;
 
   /**
    * Start a MiniHBaseCluster.
@@ -59,10 +62,27 @@ public class MiniHBaseCluster {
    * @throws IOException
    */
   public MiniHBaseCluster(Configuration conf, int numRegionServers)
-  throws IOException {
+  throws IOException, InterruptedException {
+    this(conf, 1, numRegionServers);
+  }
+
+  /**
+   * Start a MiniHBaseCluster.
+   * @param conf Configuration to be used for cluster
+   * @param numMasters initial number of masters to start.
+   * @param numRegionServers initial number of region servers to start.
+   * @throws IOException
+   */
+  public MiniHBaseCluster(Configuration conf, int numMasters,
+      int numRegionServers)
+  throws IOException, InterruptedException {
     this.conf = conf;
     conf.set(HConstants.MASTER_PORT, "0");
-    init(numRegionServers);
+    init(numMasters, numRegionServers);
+  }
+
+  public Configuration getConfiguration() {
+    return this.conf;
   }
 
   /**
@@ -76,7 +96,7 @@ public class MiniHBaseCluster {
       new ConcurrentHashMap<HServerInfo, IOException>();
 
     public MiniHBaseClusterMaster(final Configuration conf)
-    throws IOException {
+    throws IOException, KeeperException, InterruptedException {
       super(conf);
     }
 
@@ -142,12 +162,12 @@ public class MiniHBaseCluster {
    */
   public static class MiniHBaseClusterRegionServer extends HRegionServer {
     private Thread shutdownThread = null;
-    private UserGroupInformation user = null;
+    private User user = null;
 
     public MiniHBaseClusterRegionServer(Configuration conf)
-        throws IOException {
+        throws IOException, InterruptedException {
       super(conf);
-      this.user = UserGroupInformation.getCurrentUser();
+      this.user = User.getCurrent();
     }
 
     public void setHServerInfo(final HServerInfo hsi) {
@@ -163,8 +183,8 @@ public class MiniHBaseCluster {
      */
 
     @Override
-    protected void init(MapWritable c) throws IOException {
-      super.init(c);
+    protected void handleReportForDutyResponse(MapWritable c) throws IOException {
+      super.handleReportForDutyResponse(c);
       // Run this thread to shutdown our filesystem on way out.
       this.shutdownThread = new SingleFileSystemShutdownThread(getFileSystem());
     }
@@ -172,12 +192,14 @@ public class MiniHBaseCluster {
     @Override
     public void run() {
       try {
-        this.user.doAs(new PrivilegedAction<Object>(){
+        this.user.runAs(new PrivilegedAction<Object>(){
           public Object run() {
             runRegionServer();
             return null;
           }
         });
+      } catch (Throwable t) {
+        LOG.error("Exception in run", t);
       } finally {
         // Run this on the way out.
         if (this.shutdownThread != null) {
@@ -191,8 +213,22 @@ public class MiniHBaseCluster {
       super.run();
     }
 
+    @Override
     public void kill() {
       super.kill();
+    }
+
+    public void abort(final String reason, final Throwable cause) {
+      this.user.runAs(new PrivilegedAction<Object>() {
+        public Object run() {
+          abortRegionServer(reason, cause);
+          return null;
+        }
+      });
+    }
+
+    private void abortRegionServer(String reason, Throwable cause) {
+      super.abort(reason, cause);
     }
   }
 
@@ -211,22 +247,38 @@ public class MiniHBaseCluster {
       try {
         LOG.info("Hook closing fs=" + this.fs);
         this.fs.close();
+      } catch (NullPointerException npe) {
+        LOG.debug("Need to fix these: " + npe.toString());
       } catch (IOException e) {
         LOG.warn("Running hook", e);
       }
     }
   }
 
-  private void init(final int nRegionNodes) throws IOException {
+  private void init(final int nMasterNodes, final int nRegionNodes)
+  throws IOException, InterruptedException {
     try {
       // start up a LocalHBaseCluster
-      hbaseCluster = new LocalHBaseCluster(conf, nRegionNodes,
+      hbaseCluster = new LocalHBaseCluster(conf, nMasterNodes, 0,
           MiniHBaseCluster.MiniHBaseClusterMaster.class,
           MiniHBaseCluster.MiniHBaseClusterRegionServer.class);
+
+      // manually add the regionservers as other users
+      for (int i=0; i<nRegionNodes; i++) {
+        Configuration rsConf = HBaseConfiguration.create(conf);
+        User user = HBaseTestingUtility.getDifferentUser(rsConf,
+            ".hfs."+index++);
+        hbaseCluster.addRegionServer(rsConf, i, user);
+      }
+
       hbaseCluster.startup();
-    } catch(IOException e) {
+    } catch (IOException e) {
       shutdown();
       throw e;
+    } catch (Throwable t) {
+      LOG.error("Error starting cluster", t);
+      shutdown();
+      throw new IOException("Shutting down", t);
     }
   }
 
@@ -236,26 +288,21 @@ public class MiniHBaseCluster {
    * @throws IOException
    * @return New RegionServerThread
    */
-  public JVMClusterUtil.RegionServerThread startRegionServer() throws IOException {
-    JVMClusterUtil.RegionServerThread t = this.hbaseCluster.addRegionServer();
-    t.start();
-    t.waitForServerOnline();
+  public JVMClusterUtil.RegionServerThread startRegionServer()
+      throws IOException {
+    final Configuration newConf = HBaseConfiguration.create(conf);
+    User rsUser =
+        HBaseTestingUtility.getDifferentUser(newConf, ".hfs."+index++);
+    JVMClusterUtil.RegionServerThread t =  null;
+    try {
+      t = hbaseCluster.addRegionServer(
+          newConf, hbaseCluster.getRegionServers().size(), rsUser);
+      t.start();
+      t.waitForServerOnline();
+    } catch (InterruptedException ie) {
+      throw new IOException("Interrupted executing UserGroupInformation.doAs()", ie);
+    }
     return t;
-  }
-
-  /**
-   * @return Returns the rpc address actually used by the master server, because
-   * the supplied port is not necessarily the actual port used.
-   */
-  public HServerAddress getHMasterAddress() {
-    return this.hbaseCluster.getMaster().getMasterAddress();
-  }
-
-  /**
-   * @return the HMaster
-   */
-  public HMaster getMaster() {
-    return this.hbaseCluster.getMaster();
   }
 
   /**
@@ -294,7 +341,7 @@ public class MiniHBaseCluster {
     JVMClusterUtil.RegionServerThread server =
       hbaseCluster.getRegionServers().get(serverNumber);
     LOG.info("Stopping " + server.toString());
-    server.getRegionServer().stop();
+    server.getRegionServer().stop("Stopping rs " + serverNumber);
     return server;
   }
 
@@ -306,6 +353,139 @@ public class MiniHBaseCluster {
    */
   public String waitOnRegionServer(final int serverNumber) {
     return this.hbaseCluster.waitOnRegionServer(serverNumber);
+  }
+
+
+  /**
+   * Starts a master thread running
+   *
+   * @throws IOException
+   * @return New RegionServerThread
+   */
+  public JVMClusterUtil.MasterThread startMaster() throws IOException {
+    Configuration c = HBaseConfiguration.create(conf);
+    User user =
+        HBaseTestingUtility.getDifferentUser(c, ".hfs."+index++);
+
+    JVMClusterUtil.MasterThread t = null;
+    try {
+      t = hbaseCluster.addMaster(c, hbaseCluster.getMasters().size(), user);
+      t.start();
+      t.waitForServerOnline();
+    } catch (InterruptedException ie) {
+      throw new IOException("Interrupted executing UserGroupInformation.doAs()", ie);
+    }
+    return t;
+  }
+
+  /**
+   * @return Returns the rpc address actually used by the currently active
+   * master server, because the supplied port is not necessarily the actual port
+   * used.
+   */
+  public HServerAddress getHMasterAddress() {
+    return this.hbaseCluster.getActiveMaster().getMasterAddress();
+  }
+
+  /**
+   * Returns the current active master, if available.
+   * @return the active HMaster, null if none is active.
+   */
+  public HMaster getMaster() {
+    return this.hbaseCluster.getActiveMaster();
+  }
+
+  /**
+   * Returns the master at the specified index, if available.
+   * @return the active HMaster, null if none is active.
+   */
+  public HMaster getMaster(final int serverNumber) {
+    return this.hbaseCluster.getMaster(serverNumber);
+  }
+
+  /**
+   * Cause a master to exit without shutting down entire cluster.
+   * @param serverNumber  Used as index into a list.
+   */
+  public String abortMaster(int serverNumber) {
+    HMaster server = getMaster(serverNumber);
+    LOG.info("Aborting " + server.toString());
+    server.abort("Aborting for tests", new Exception("Trace info"));
+    return server.toString();
+  }
+
+  /**
+   * Shut down the specified master cleanly
+   *
+   * @param serverNumber  Used as index into a list.
+   * @return the region server that was stopped
+   */
+  public JVMClusterUtil.MasterThread stopMaster(int serverNumber) {
+    return stopMaster(serverNumber, true);
+  }
+
+  /**
+   * Shut down the specified master cleanly
+   *
+   * @param serverNumber  Used as index into a list.
+   * @param shutdownFS True is we are to shutdown the filesystem as part of this
+   * master's shutdown.  Usually we do but you do not want to do this if
+   * you are running multiple master in a test and you shut down one
+   * before end of the test.
+   * @return the master that was stopped
+   */
+  public JVMClusterUtil.MasterThread stopMaster(int serverNumber,
+      final boolean shutdownFS) {
+    JVMClusterUtil.MasterThread server =
+      hbaseCluster.getMasters().get(serverNumber);
+    LOG.info("Stopping " + server.toString());
+    server.getMaster().stop("Stopping master " + serverNumber);
+    return server;
+  }
+
+  /**
+   * Wait for the specified master to stop. Removes this thread from list
+   * of running threads.
+   * @param serverNumber
+   * @return Name of master that just went down.
+   */
+  public String waitOnMaster(final int serverNumber) {
+    return this.hbaseCluster.waitOnMaster(serverNumber);
+  }
+
+  /**
+   * Blocks until there is an active master and that master has completed
+   * initialization.
+   *
+   * @return true if an active master becomes available.  false if there are no
+   *         masters left.
+   * @throws InterruptedException
+   */
+  public boolean waitForActiveAndReadyMaster() throws InterruptedException {
+    List<JVMClusterUtil.MasterThread> mts;
+    while ((mts = getMasterThreads()).size() > 0) {
+      for (JVMClusterUtil.MasterThread mt : mts) {
+        if (mt.getMaster().isActiveMaster() && mt.getMaster().isInitialized()) {
+          return true;
+        }
+      }
+      Thread.sleep(200);
+    }
+    return false;
+  }
+
+  /**
+   * @return List of master threads.
+   */
+  public List<JVMClusterUtil.MasterThread> getMasterThreads() {
+    return this.hbaseCluster.getMasters();
+  }
+
+  /**
+   * @return List of live master threads (skips the aborted and the killed)
+   */
+  public List<JVMClusterUtil.MasterThread> getLiveMasterThreads() {
+    return this.hbaseCluster.getLiveMasters();
   }
 
   /**
@@ -333,7 +513,7 @@ public class MiniHBaseCluster {
   public void flushcache() throws IOException {
     for (JVMClusterUtil.RegionServerThread t:
         this.hbaseCluster.getRegionServers()) {
-      for(HRegion r: t.getRegionServer().getOnlineRegions()) {
+      for(HRegion r: t.getRegionServer().getOnlineRegionsLocalContext()) {
         r.flushcache();
       }
     }
@@ -346,7 +526,7 @@ public class MiniHBaseCluster {
   public void flushcache(byte [] tableName) throws IOException {
     for (JVMClusterUtil.RegionServerThread t:
         this.hbaseCluster.getRegionServers()) {
-      for(HRegion r: t.getRegionServer().getOnlineRegions()) {
+      for(HRegion r: t.getRegionServer().getOnlineRegionsLocalContext()) {
         if(Bytes.equals(r.getTableDesc().getName(), tableName)) {
           r.flushcache();
         }
@@ -381,7 +561,7 @@ public class MiniHBaseCluster {
     List<HRegion> ret = new ArrayList<HRegion>();
     for (JVMClusterUtil.RegionServerThread rst : getRegionServerThreads()) {
       HRegionServer hrs = rst.getRegionServer();
-      for (HRegion region : hrs.getOnlineRegions()) {
+      for (HRegion region : hrs.getOnlineRegionsLocalContext()) {
         if (Bytes.equals(region.getTableDesc().getName(), tableName)) {
           ret.add(region);
         }
@@ -471,5 +651,19 @@ public class MiniHBaseCluster {
     final HMsg msg)
   throws IOException {
     ((MiniHBaseClusterMaster)getMaster()).addMessage(hrs.getHServerInfo(), msg);
+  }
+
+  /**
+   * Counts the total numbers of regions being served by the currently online
+   * region servers by asking each how many regions they have.  Does not look
+   * at META at all.  Count includes catalog tables.
+   * @return number of regions being served by all region servers
+   */
+  public long countServedRegions() {
+    long count = 0;
+    for (JVMClusterUtil.RegionServerThread rst : getLiveRegionServerThreads()) {
+      count += rst.getRegionServer().getNumberOfOnlineRegions();
+    }
+    return count;
   }
 }

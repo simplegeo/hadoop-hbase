@@ -1,0 +1,31 @@
+From 5e4420bddcea5593f62c5b5ec07ca829a59ab3ba Mon Sep 17 00:00:00 2001
+From: todd <todd@ubuntu64-build01.(none)>
+Date: Sun, 27 Jun 2010 23:24:58 -0700
+Subject: [PATCH 3/9] CLOUDERA-BUILD. rsync all of lib into target directory
+
+Otherwise shell doesn't work, since we don't get .rb files
+
+CLOUDERA-BUILD. Replace rsync with cp.
+---
+ cloudera/install_hbase.sh |    5 +----
+ 1 files changed, 1 insertions(+), 4 deletions(-)
+
+diff --git a/cloudera/install_hbase.sh b/cloudera/install_hbase.sh
+index 74090d4..6e9f257 100755
+--- a/cloudera/install_hbase.sh
++++ b/cloudera/install_hbase.sh
+@@ -93,10 +93,7 @@ install -d -m 0755 $PREFIX/$DOC_DIR
+ install -d -m 0755 $PREFIX/$BIN_DIR
+ install -d -m 0755 $PREFIX/$ETC_DIR
+ 
+-for i in `find lib/*.jar -type f `
+-        do echo "Copying $i"
+-        cp $i ${PREFIX}/${LIB_DIR}/lib #don't copy directories by default
+-done
++cp -ra lib/* ${PREFIX}/${LIB_DIR}/lib/
+ cp hbase*.jar $PREFIX/$LIB_DIR
+ cp -a docs/* $PREFIX/$DOC_DIR
+ cp *.txt $PREFIX/$DOC_DIR/
+-- 
+1.7.0.4
+

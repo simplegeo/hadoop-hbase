@@ -42,7 +42,9 @@ import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HTableInterface;
+import org.apache.hadoop.hbase.client.Increment;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.client.Row;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.RowLock;
@@ -587,6 +589,9 @@ public class RemoteHTable implements HTableInterface {
     throw new IOException("checkAndDelete not supported");
   }
 
+  public Result increment(Increment increment) throws IOException {
+    throw new IOException("Increment not supported");
+  }
 
   public long incrementColumnValue(byte[] row, byte[] family, byte[] qualifier,
       long amount) throws IOException {
@@ -596,6 +601,21 @@ public class RemoteHTable implements HTableInterface {
   public long incrementColumnValue(byte[] row, byte[] family, byte[] qualifier,
       long amount, boolean writeToWAL) throws IOException {
     throw new IOException("incrementColumnValue not supported");
+  }
+
+  @Override
+  public void batch(List<Row> actions, Object[] results) throws IOException {
+    throw new IOException("batch not supported");
+  }
+
+  @Override
+  public Object[] batch(List<Row> actions) throws IOException {
+    throw new IOException("batch not supported");
+  }
+
+  @Override
+  public Result[] get(List<Get> gets) throws IOException {
+    throw new IOException("get(List<Get>) not supported");
   }
 
 }

@@ -26,39 +26,33 @@ import java.io.IOException;
 import javax.xml.bind.JAXBContext;
 import javax.xml.bind.JAXBException;
 
+import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.rest.client.Client;
 import org.apache.hadoop.hbase.rest.client.Cluster;
 import org.apache.hadoop.hbase.rest.client.Response;
 import org.apache.hadoop.hbase.rest.model.StorageClusterStatusModel;
 import org.apache.hadoop.hbase.util.Bytes;
 
-public class TestStatusResource extends HBaseRESTClusterTestBase {
-  static final byte[] ROOT_REGION_NAME = Bytes.toBytes("-ROOT-,,0");
-  static final byte[] META_REGION_NAME = Bytes.toBytes(".META.,,1");
+import static org.junit.Assert.*;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
-  Client client;
-  JAXBContext context;
+public class TestStatusResource {
+  private static final byte[] ROOT_REGION_NAME = Bytes.toBytes("-ROOT-,,0");
+  private static final byte[] META_REGION_NAME = Bytes.toBytes(".META.,,1");
+
+  private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+  private static final HBaseRESTTestingUtility REST_TEST_UTIL = 
+    new HBaseRESTTestingUtility();
+  private static Client client;
+  private static JAXBContext context;
   
-  @Override
-  protected void setUp() throws Exception {
-    super.setUp();
-    context = JAXBContext.newInstance(
-      StorageClusterStatusModel.class);
-    client = new Client(new Cluster().add("localhost", testServletPort));
-  }
-
-  @Override
-  protected void tearDown() throws Exception {
-    client.shutdown();
-    super.tearDown();
-  }
-
-  void validate(StorageClusterStatusModel model) {
+  private static void validate(StorageClusterStatusModel model) {
     assertNotNull(model);
-    assertTrue(model.getRegions() >= 2);
+    assertTrue(model.getRegions() >= 1);
     assertTrue(model.getRequests() >= 0);
-    // assumes minicluster with two regionservers
-    assertTrue(model.getAverageLoad() >= 1.0);
+    assertTrue(model.getAverageLoad() >= 0.0);
     assertNotNull(model.getLiveNodes());
     assertNotNull(model.getDeadNodes());
     assertFalse(model.getLiveNodes().isEmpty());
@@ -67,7 +61,6 @@ public class TestStatusResource extends HBaseRESTClusterTestBase {
       assertNotNull(node.getName());
       assertTrue(node.getStartCode() > 0L);
       assertTrue(node.getRequests() >= 0);
-      assertFalse(node.getRegions().isEmpty());
       for (StorageClusterStatusModel.Node.Region region: node.getRegions()) {
         if (Bytes.equals(region.getName(), ROOT_REGION_NAME)) {
           foundRoot = true;
@@ -80,25 +73,38 @@ public class TestStatusResource extends HBaseRESTClusterTestBase {
     assertTrue(foundMeta);
   }
 
-  void doTestGetClusterStatusXML() throws IOException, JAXBException {
-    Response response = client.get("/status/cluster", MIMETYPE_XML);
+  @BeforeClass
+  public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.startMiniCluster(3);
+    REST_TEST_UTIL.startServletContainer(TEST_UTIL.getConfiguration());
+    client = new Client(new Cluster().add("localhost", 
+      REST_TEST_UTIL.getServletPort()));
+    context = JAXBContext.newInstance(StorageClusterStatusModel.class);
+  }
+
+  @AfterClass
+  public static void tearDownAfterClass() throws Exception {
+    REST_TEST_UTIL.shutdownServletContainer();
+    TEST_UTIL.shutdownMiniCluster();
+  }
+
+  @Test
+  public void testGetClusterStatusXML() throws IOException, JAXBException {
+    Response response = client.get("/status/cluster", Constants.MIMETYPE_XML);
     assertEquals(response.getCode(), 200);
     StorageClusterStatusModel model = (StorageClusterStatusModel)
       context.createUnmarshaller().unmarshal(
         new ByteArrayInputStream(response.getBody()));
     validate(model);
   }
-  
-  void doTestGetClusterStatusPB() throws IOException {
-    Response response = client.get("/status/cluster", MIMETYPE_PROTOBUF);
+
+  @Test
+  public void testGetClusterStatusPB() throws IOException {
+    Response response = client.get("/status/cluster", 
+      Constants.MIMETYPE_PROTOBUF);
     assertEquals(response.getCode(), 200);
     StorageClusterStatusModel model = new StorageClusterStatusModel();
     model.getObjectFromMessage(response.getBody());
     validate(model);
-  }
-
-  public void testStatusResource() throws Exception {
-    doTestGetClusterStatusXML();
-    doTestGetClusterStatusPB();
   }
 }

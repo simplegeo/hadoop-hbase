@@ -28,17 +28,23 @@ import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.util.StringUtils;
 
+import com.google.common.base.Preconditions;
+
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
-import java.util.ArrayList;
 import java.util.ConcurrentModificationException;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
+import java.util.TreeSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.DelayQueue;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -56,18 +62,20 @@ class MemStoreFlusher extends Thread implements FlushRequester {
   // a corresponding entry in the other.
   private final BlockingQueue<FlushQueueEntry> flushQueue =
     new DelayQueue<FlushQueueEntry>();
-  private final Map<HRegion, FlushQueueEntry> regionsInQueue =
-    new HashMap<HRegion, FlushQueueEntry>();
+  private final Map<HRegion, FlushRegionEntry> regionsInQueue =
+    new HashMap<HRegion, FlushRegionEntry>();
+  private AtomicBoolean wakeupPending = new AtomicBoolean();
 
   private final long threadWakeFrequency;
   private final HRegionServer server;
   private final ReentrantLock lock = new ReentrantLock();
+  private final Condition flushOccurred = lock.newCondition();
 
   protected final long globalMemStoreLimit;
   protected final long globalMemStoreLimitLowMark;
 
   private static final float DEFAULT_UPPER = 0.4f;
-  private static final float DEFAULT_LOWER = 0.25f;
+  private static final float DEFAULT_LOWER = 0.35f;
   private static final String UPPER_KEY =
     "hbase.regionserver.global.memstore.upperLimit";
   private static final String LOWER_KEY =
@@ -96,7 +104,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
     }
     this.globalMemStoreLimitLowMark = lower;
     this.blockingStoreFilesNumber =
-      conf.getInt("hbase.hstore.blockingStoreFiles", -1);
+      conf.getInt("hbase.hstore.blockingStoreFiles", 7);
     if (this.blockingStoreFilesNumber == -1) {
       this.blockingStoreFilesNumber = 1 +
         conf.getInt("hbase.hstore.compactionThreshold", 3);
@@ -133,17 +141,97 @@ class MemStoreFlusher extends Thread implements FlushRequester {
     }
     return (long)(max * limit);
   }
+  
+  /**
+   * The memstore across all regions has exceeded the low water mark. Pick
+   * one region to flush and flush it synchronously (this is called from the
+   * flush thread)
+   * @return true if successful
+   */
+  private boolean flushOneForGlobalPressure() {
+    SortedMap<Long, HRegion> regionsBySize =
+        server.getCopyOfOnlineRegionsSortedBySize();
+
+    // TODO: HBASE-3532 - we can't use Set<HRegion> here because it doesn't
+    // implement equals correctly. So, set of region names.
+    Set<byte[]> excludedRegionNames = new TreeSet<byte[]>(Bytes.BYTES_COMPARATOR);
+
+    boolean flushedOne = false;
+    while (!flushedOne) {
+      // Find the biggest region that doesn't have too many storefiles
+      HRegion bestFlushableRegion = getBiggestMemstoreRegion(
+          regionsBySize, excludedRegionNames, true);
+      // Find the biggest region, total, even if it might have too many flushes.
+      HRegion bestAnyRegion = getBiggestMemstoreRegion(
+          regionsBySize, excludedRegionNames, false);
+
+      if (bestAnyRegion == null) {
+        LOG.fatal("Above memory mark but there are no flushable regions!");
+        return false;
+      }
+      
+      HRegion regionToFlush;
+      if (bestAnyRegion.memstoreSize.get() > 2 * bestFlushableRegion.memstoreSize.get()) {
+        // Even if it's not supposed to be flushed, pick a region if it's more than twice
+        // as big as the best flushable one - otherwise when we're under pressure we make
+        // lots of little flushes and cause lots of compactions, etc, which just makes
+        // life worse!
+        LOG.info("Under global heap pressure: " +
+            "Region " + bestAnyRegion.getRegionNameAsString() + " has too many " +
+            "store files, but is " +
+            StringUtils.humanReadableInt(bestAnyRegion.memstoreSize.get()) +
+            " vs best flushable region's " +
+            StringUtils.humanReadableInt(bestFlushableRegion.memstoreSize.get()) +
+            ". Choosing the bigger.");
+        regionToFlush = bestAnyRegion;
+      } else {
+        regionToFlush = bestFlushableRegion;
+      }
+      
+      Preconditions.checkState(regionToFlush.memstoreSize.get() > 0);
+      
+      LOG.info("Flush of region " + regionToFlush + " due to global heap pressure");
+      flushedOne = flushRegion(regionToFlush, true);
+      if (!flushedOne) {
+        LOG.info("Excluding unflushable region " + regionToFlush +
+          " - trying to find a different region to flush.");
+        excludedRegionNames.add(regionToFlush.getRegionName());
+      }
+    }
+    return true;
+  }
 
   @Override
   public void run() {
-    while (!this.server.isStopRequested()) {
+    while (!this.server.isStopped()) {
       FlushQueueEntry fqe = null;
       try {
+        wakeupPending.set(false); // allow someone to wake us up again
         fqe = flushQueue.poll(threadWakeFrequency, TimeUnit.MILLISECONDS);
-        if (fqe == null) {
+        if (fqe == null || fqe instanceof WakeupFlushThread) {
+          if (isAboveLowWaterMark()) {
+            LOG.info("Flush thread woke up with memory above low water.");
+            if (!flushOneForGlobalPressure()) {
+              // Wasn't able to flush any region, but we're above low water mark
+              // This is unlikely to happen, but might happen when closing the
+              // entire server - another thread is flushing regions. We'll just
+              // sleep a little bit to avoid spinning, and then pretend that
+              // we flushed one, so anyone blocked will check again
+              lock.lock();
+              try {
+                Thread.sleep(1000);
+                flushOccurred.signalAll();
+              } finally {
+                lock.unlock();
+              }
+            }
+            // Enqueue another one of these tokens so we'll wake up again
+            wakeupFlushThread();            
+          }
           continue;
         }
-        if (!flushRegion(fqe)) {
+        FlushRegionEntry fre = (FlushRegionEntry)fqe;
+        if (!flushRegion(fre)) {
           break;
         }
       } catch (InterruptedException ex) {
@@ -151,9 +239,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
       } catch (ConcurrentModificationException ex) {
         continue;
       } catch (Exception ex) {
-        LOG.error("Cache flush failed" +
-          (fqe != null ? (" for region " + Bytes.toString(fqe.region.getRegionName())) : ""),
-          ex);
+        LOG.error("Cache flusher failed for entry " + fqe);
         if (!server.checkFileSystem()) {
           break;
         }
@@ -161,19 +247,70 @@ class MemStoreFlusher extends Thread implements FlushRequester {
     }
     this.regionsInQueue.clear();
     this.flushQueue.clear();
+
+    // Signal anyone waiting, so they see the close flag
+    lock.lock();
+    try {
+      flushOccurred.signalAll();
+    } finally {
+      lock.unlock();
+    }
     LOG.info(getName() + " exiting");
   }
 
-  public void request(HRegion r) {
+  private void wakeupFlushThread() {
+    if (wakeupPending.compareAndSet(false, true)) {
+      flushQueue.add(new WakeupFlushThread());
+    }
+  }
+
+  private HRegion getBiggestMemstoreRegion(
+      SortedMap<Long, HRegion> regionsBySize,
+      Set<byte[]> excludedRegionNames,
+      boolean checkStoreFileCount) {
+    synchronized (regionsInQueue) {
+      for (HRegion region : regionsBySize.values()) {
+        if (excludedRegionNames.contains(region.getRegionName())) {
+          continue;
+        }
+
+        if (checkStoreFileCount && isTooManyStoreFiles(region)) {
+          continue;
+        }
+        return region;
+      }
+    }
+    return null;
+  }
+  
+  /**
+   * Return true if global memory usage is above the high watermark
+   */
+  private boolean isAboveHighWaterMark() {
+    return server.getGlobalMemStoreSize() >= globalMemStoreLimit;
+  }
+  
+  /**
+   * Return true if we're above the high watermark
+   */
+  private boolean isAboveLowWaterMark() {
+    return server.getGlobalMemStoreSize() >= globalMemStoreLimitLowMark;
+  }
+
+  public void requestFlush(HRegion r) {
     synchronized (regionsInQueue) {
       if (!regionsInQueue.containsKey(r)) {
         // This entry has no delay so it will be added at the top of the flush
         // queue.  It'll come out near immediately.
-        FlushQueueEntry fqe = new FlushQueueEntry(r);
+        FlushRegionEntry fqe = new FlushRegionEntry(r);
         this.regionsInQueue.put(r, fqe);
         this.flushQueue.add(fqe);
       }
     }
+  }
+
+  public int getFlushQueueSize() {
+    return flushQueue.size();
   }
 
   /**
@@ -196,7 +333,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
    * false, there will be accompanying log messages explaining why the log was
    * not flushed.
    */
-  private boolean flushRegion(final FlushQueueEntry fqe) {
+  private boolean flushRegion(final FlushRegionEntry fqe) {
     HRegion region = fqe.region;
     if (!fqe.region.getRegionInfo().isMetaRegion() &&
         isTooManyStoreFiles(region)) {
@@ -212,7 +349,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
           LOG.warn("Region " + region.getRegionNameAsString() + " has too many " +
             "store files; delaying flush up to " + this.blockingWaitTime + "ms");
         }
-        this.server.compactSplitThread.compactionRequested(region, getName());
+        this.server.compactSplitThread.requestCompaction(region, getName());
         // Put back on the queue.  Have it come back out of the queue
         // after a delay of this.blockingWaitTime / 100 ms.
         this.flushQueue.add(fqe.requeue(this.blockingWaitTime / 100));
@@ -237,7 +374,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
    */
   private boolean flushRegion(final HRegion region, final boolean emergencyFlush) {
     synchronized (this.regionsInQueue) {
-      FlushQueueEntry fqe = this.regionsInQueue.remove(region);
+      FlushRegionEntry fqe = this.regionsInQueue.remove(region);
       if (fqe != null && emergencyFlush) {
         // Need to remove from region from delay queue.  When NOT an
         // emergencyFlush, then item was removed via a flushQueue.poll.
@@ -247,8 +384,9 @@ class MemStoreFlusher extends Thread implements FlushRequester {
     }
     try {
       if (region.flushcache()) {
-        server.compactSplitThread.compactionRequested(region, getName());
+        server.compactSplitThread.requestCompaction(region, getName());
       }
+      server.getMetrics().addFlush(region.getRecentFlushInfo());
     } catch (DroppedSnapshotException ex) {
       // Cache flush can fail in a few places. If it fails in a critical
       // section, we get a DroppedSnapshotException and a replay of hlog
@@ -265,6 +403,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
         return false;
       }
     } finally {
+      flushOccurred.signalAll();
       lock.unlock();
     }
     return true;
@@ -286,49 +425,44 @@ class MemStoreFlusher extends Thread implements FlushRequester {
    * amount of memstore consumption.
    */
   public synchronized void reclaimMemStoreMemory() {
-    if (server.getGlobalMemStoreSize() >= globalMemStoreLimit) {
-      flushSomeRegions();
+    if (isAboveHighWaterMark()) {
+      lock.lock();
+      try {
+        while (isAboveHighWaterMark() && !server.isStopped()) {
+          wakeupFlushThread();
+          try {
+            // we should be able to wait forever, but we've seen a bug where
+            // we miss a notify, so put a 5 second bound on it at least.
+            flushOccurred.await(5, TimeUnit.SECONDS);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+          }
+        }
+      } finally {
+        lock.unlock();
+      }
+    } else if (isAboveLowWaterMark()) {
+      wakeupFlushThread();
     }
   }
 
-  /*
-   * Emergency!  Need to flush memory.
+  interface FlushQueueEntry extends Delayed {}
+  
+  /**
+   * Token to insert into the flush queue that ensures that the flusher does not sleep
    */
-  private synchronized void flushSomeRegions() {
-    // keep flushing until we hit the low water mark
-    long globalMemStoreSize = -1;
-    ArrayList<HRegion> regionsToCompact = new ArrayList<HRegion>();
-    for (SortedMap<Long, HRegion> m =
-        this.server.getCopyOfOnlineRegionsSortedBySize();
-      (globalMemStoreSize = server.getGlobalMemStoreSize()) >=
-        this.globalMemStoreLimitLowMark;) {
-      // flush the region with the biggest memstore
-      if (m.size() <= 0) {
-        LOG.info("No online regions to flush though we've been asked flush " +
-          "some; globalMemStoreSize=" +
-          StringUtils.humanReadableInt(globalMemStoreSize) +
-          ", globalMemStoreLimitLowMark=" +
-          StringUtils.humanReadableInt(this.globalMemStoreLimitLowMark));
-        break;
-      }
-      HRegion biggestMemStoreRegion = m.remove(m.firstKey());
-      LOG.info("Forced flushing of " +  biggestMemStoreRegion.toString() +
-        " because global memstore limit of " +
-        StringUtils.humanReadableInt(this.globalMemStoreLimit) +
-        " exceeded; currently " +
-        StringUtils.humanReadableInt(globalMemStoreSize) + " and flushing till " +
-        StringUtils.humanReadableInt(this.globalMemStoreLimitLowMark));
-      if (!flushRegion(biggestMemStoreRegion, true)) {
-        LOG.warn("Flush failed");
-        break;
-      }
-      regionsToCompact.add(biggestMemStoreRegion);
+  static class WakeupFlushThread implements FlushQueueEntry {
+    @Override
+    public long getDelay(TimeUnit unit) {
+      return 0;
     }
-    for (HRegion region : regionsToCompact) {
-      server.compactSplitThread.compactionRequested(region, getName());
+
+    @Override
+    public int compareTo(Delayed o) {
+      return -1;
     }
   }
-
+  
   /**
    * Datastructure used in the flush queue.  Holds region and retry count.
    * Keeps tabs on how old this object is.  Implements {@link Delayed}.  On
@@ -337,13 +471,14 @@ class MemStoreFlusher extends Thread implements FlushRequester {
    * milliseconds before readding to delay queue if you want it to stay there
    * a while.
    */
-  static class FlushQueueEntry implements Delayed {
+  static class FlushRegionEntry implements FlushQueueEntry {
     private final HRegion region;
+    
     private final long createTime;
     private long whenToExpire;
     private int requeueCount = 0;
 
-    FlushQueueEntry(final HRegion r) {
+    FlushRegionEntry(final HRegion r) {
       this.region = r;
       this.createTime = System.currentTimeMillis();
       this.whenToExpire = this.createTime;
@@ -371,7 +506,7 @@ class MemStoreFlusher extends Thread implements FlushRequester {
      * to whatever you pass.
      * @return This.
      */
-    public FlushQueueEntry requeue(final long when) {
+    public FlushRegionEntry requeue(final long when) {
       this.whenToExpire = System.currentTimeMillis() + when;
       this.requeueCount++;
       return this;
@@ -387,6 +522,11 @@ class MemStoreFlusher extends Thread implements FlushRequester {
     public int compareTo(Delayed other) {
       return Long.valueOf(getDelay(TimeUnit.MILLISECONDS) -
         other.getDelay(TimeUnit.MILLISECONDS)).intValue();
+    }
+    
+    @Override
+    public String toString() {
+      return "[flush region " + Bytes.toString(region.getRegionName()) + "]";
     }
   }
 }

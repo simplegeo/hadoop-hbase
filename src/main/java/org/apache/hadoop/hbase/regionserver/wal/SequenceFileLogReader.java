@@ -20,21 +20,23 @@
 
 package org.apache.hadoop.hbase.regionserver.wal;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.lang.Class;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
  
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.regionserver.wal.HLog;
-import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
 import org.apache.hadoop.io.SequenceFile;
-import org.mortbay.log.Log;
 
 public class SequenceFileLogReader implements HLog.Reader {
+  private static final Log LOG = LogFactory.getLog(SequenceFileLogReader.class);
 
   /**
    * Hack just to set the correct file length up in SequenceFile.Reader.
@@ -48,7 +50,7 @@ public class SequenceFileLogReader implements HLog.Reader {
    *         this.end = in.getPos() + length;
    *
    */
-  private static class WALReader extends SequenceFile.Reader {
+  static class WALReader extends SequenceFile.Reader {
 
     WALReader(final FileSystem fs, final Path p, final Configuration c)
     throws IOException {
@@ -77,18 +79,45 @@ public class SequenceFileLogReader implements HLog.Reader {
         this.length = l;
       }
 
+      // This section can be confusing.  It is specific to how HDFS works.
+      // Let me try to break it down.  This is the problem:
+      //
+      //  1. HDFS DataNodes update the NameNode about a filename's length 
+      //     on block boundaries or when a file is closed. Therefore, 
+      //     if an RS dies, then the NN's fs.getLength() can be out of date
+      //  2. this.in.available() would work, but it returns int &
+      //     therefore breaks for files > 2GB (happens on big clusters)
+      //  3. DFSInputStream.getFileLength() gets the actual length from the DNs
+      //  4. DFSInputStream is wrapped 2 levels deep : this.in.in
+      //
+      // So, here we adjust getPos() using getFileLength() so the
+      // SequenceFile.Reader constructor (aka: first invocation) comes out 
+      // with the correct end of the file:
+      //         this.end = in.getPos() + length;
       @Override
       public long getPos() throws IOException {
         if (this.firstGetPosInvocation) {
           this.firstGetPosInvocation = false;
-          // Tell a lie.  We're doing this just so that this line up in
-          // SequenceFile.Reader constructor comes out with the correct length
-          // on the file:
-          //         this.end = in.getPos() + length;
-          long available = this.in.available();
-          // Length gets added up in the SF.Reader constructor so subtract the
-          // difference.  If available < this.length, then return this.length.
-          return available >= this.length? available - this.length: this.length;
+          long adjust = 0;
+
+          try {
+            Field fIn = FilterInputStream.class.getDeclaredField("in");
+            fIn.setAccessible(true);
+            Object realIn = fIn.get(this.in);
+            Method getFileLength = realIn.getClass().
+              getMethod("getFileLength", new Class<?> []{});
+            getFileLength.setAccessible(true);
+            long realLength = ((Long)getFileLength.
+              invoke(realIn, new Object []{})).longValue();
+            assert(realLength >= this.length);
+            adjust = realLength - this.length;
+          } catch(Exception e) {
+            SequenceFileLogReader.LOG.warn(
+              "Error while trying to get accurate file length.  " +
+              "Truncation / data loss may occur if RegionServers die.", e);
+          }
+
+          return adjust + super.getPos();
         }
         return super.getPos();
       }
@@ -102,7 +131,24 @@ public class SequenceFileLogReader implements HLog.Reader {
   int edit = 0;
   long entryStart = 0;
 
-  public SequenceFileLogReader() { }
+  protected Class<? extends HLogKey> keyClass;
+
+  /**
+   * Default constructor.
+   */
+  public SequenceFileLogReader() {
+  }
+
+  /**
+   * This constructor allows a specific HLogKey implementation to override that
+   * which would otherwise be chosen via configuration property.
+   * 
+   * @param keyClass
+   */
+  public SequenceFileLogReader(Class<? extends HLogKey> keyClass) {
+    this.keyClass = keyClass;
+  }
+
 
   @Override
   public void init(FileSystem fs, Path path, Configuration conf)
@@ -131,7 +177,19 @@ public class SequenceFileLogReader implements HLog.Reader {
     this.entryStart = this.reader.getPosition();
     HLog.Entry e = reuse;
     if (e == null) {
-      HLogKey key = HLog.newKey(conf);
+      HLogKey key;
+      if (keyClass == null) {
+        key = HLog.newKey(conf);
+      } else {
+        try {
+          key = keyClass.newInstance();
+        } catch (InstantiationException ie) {
+          throw new IOException(ie);
+        } catch (IllegalAccessException iae) {
+          throw new IOException(iae);
+        }
+      }
+      
       WALEdit val = new WALEdit();
       e = new HLog.Entry(key, val);
     }
@@ -159,13 +217,13 @@ public class SequenceFileLogReader implements HLog.Reader {
     return reader.getPosition();
   }
 
-  private IOException addFileInfoToException(final IOException ioe)
+  protected IOException addFileInfoToException(final IOException ioe)
   throws IOException {
     long pos = -1;
     try {
       pos = getPosition();
     } catch (IOException e) {
-      Log.warn("Failed getting position to add to throw", e);
+      LOG.warn("Failed getting position to add to throw", e);
     }
 
     // See what SequenceFile.Reader thinks is the end of the file
