@@ -49,6 +49,8 @@ import java.util.TreeSet;
  * To scan everything for each row, instantiate a Scan object.
  * <p>
  * To modify scanner caching for just this scan, use {@link #setCaching(int) setCaching}.
+ * If caching is NOT set, we will use the caching value of the hosting
+ * {@link HTable}.  See {@link HTable#setScannerCaching(int)}.
  * <p>
  * To further define the scope of what to get when scanning, perform additional
  * methods as outlined below.
@@ -82,6 +84,9 @@ public class Scan implements Writable {
   private byte [] stopRow  = HConstants.EMPTY_END_ROW;
   private int maxVersions = 1;
   private int batch = -1;
+  /*
+   * -1 means no caching
+   */
   private int caching = -1;
   private boolean cacheBlocks = true;
   private Filter filter = null;
@@ -158,6 +163,7 @@ public class Scan implements Writable {
     this.startRow = get.getRow();
     this.stopRow = get.getRow();
     this.filter = get.getFilter();
+    this.cacheBlocks = get.getCacheBlocks();
     this.maxVersions = get.getMaxVersions();
     this.tr = get.getTimeRange();
     this.familyMap = get.getFamilyMap();
@@ -440,9 +446,9 @@ public class Scan implements Writable {
   public String toString() {
     StringBuilder sb = new StringBuilder();
     sb.append("startRow=");
-    sb.append(Bytes.toString(this.startRow));
+    sb.append(Bytes.toStringBinary(this.startRow));
     sb.append(", stopRow=");
-    sb.append(Bytes.toString(this.stopRow));
+    sb.append(Bytes.toStringBinary(this.stopRow));
     sb.append(", maxVersions=");
     sb.append(this.maxVersions);
     sb.append(", batch=");
@@ -468,7 +474,7 @@ public class Scan implements Writable {
         sb.append("{");
       }
       sb.append("(family=");
-      sb.append(Bytes.toString(entry.getKey()));
+      sb.append(Bytes.toStringBinary(entry.getKey()));
       sb.append(", columns=");
       if(entry.getValue() == null) {
         sb.append("ALL");
@@ -481,7 +487,7 @@ public class Scan implements Writable {
           } else {
             moreThanOneB = true;
           }
-          sb.append(Bytes.toString(column));
+          sb.append(Bytes.toStringBinary(column));
         }
         sb.append("}");
       }

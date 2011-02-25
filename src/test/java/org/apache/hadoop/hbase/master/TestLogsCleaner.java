@@ -21,30 +21,28 @@ package org.apache.hadoop.hbase.master;
 
 import static org.junit.Assert.assertEquals;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
-
-import org.apache.hadoop.hbase.HBaseTestingUtility;
-import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.regionserver.HRegionServer;
-import org.apache.hadoop.hbase.replication.ReplicationZookeeperWrapper;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.conf.Configuration;
-
+import java.io.IOException;
 import java.net.URLEncoder;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.HBaseTestingUtility;
+import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.Server;
+import org.apache.hadoop.hbase.catalog.CatalogTracker;
+import org.apache.hadoop.hbase.replication.ReplicationZookeeper;
+import org.apache.hadoop.hbase.replication.regionserver.Replication;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
 public class TestLogsCleaner {
 
   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
-
-  private ReplicationZookeeperWrapper zkHelper;
 
   /**
    * @throws java.lang.Exception
@@ -62,34 +60,21 @@ public class TestLogsCleaner {
     TEST_UTIL.shutdownMiniZKCluster();
   }
 
-  /**
-   * @throws java.lang.Exception
-   */
-  @Before
-  public void setUp() throws Exception {
-    Configuration conf = TEST_UTIL.getConfiguration();
-    zkHelper = new ReplicationZookeeperWrapper(
-        ZooKeeperWrapper.createInstance(conf, HRegionServer.class.getName()),
-        conf, new AtomicBoolean(true), "test-cluster");
-  }
-
-  /**
-   * @throws java.lang.Exception
-   */
-  @After
-  public void tearDown() throws Exception {
-  }
-
   @Test
   public void testLogCleaning() throws Exception{
-    Configuration c = TEST_UTIL.getConfiguration();
-    Path oldLogDir = new Path(TEST_UTIL.getTestDir(),
-        HConstants.HREGION_OLDLOGDIR_NAME);
-    String fakeMachineName = URLEncoder.encode("regionserver:60020", "UTF8");
+    Configuration conf = TEST_UTIL.getConfiguration();
+    conf.setBoolean(HConstants.REPLICATION_ENABLE_KEY, true);
+    Replication.decorateMasterConfiguration(conf);
+    Server server = new DummyServer();
+    ReplicationZookeeper zkHelper =
+        new ReplicationZookeeper(server, new AtomicBoolean(true));
 
-    FileSystem fs = FileSystem.get(c);
-    AtomicBoolean stop = new AtomicBoolean(false);
-    LogsCleaner cleaner = new LogsCleaner(1000, stop,c, fs, oldLogDir);
+    Path oldLogDir = new Path(HBaseTestingUtility.getTestDir(),
+        HConstants.HREGION_OLDLOGDIR_NAME);
+    String fakeMachineName = URLEncoder.encode(server.getServerName(), "UTF8");
+
+    FileSystem fs = FileSystem.get(conf);
+    LogCleaner cleaner  = new LogCleaner(1000, server, conf, fs, oldLogDir);
 
     // Create 2 invalid files, 1 "recent" file, 1 very new file and 30 old files
     long now = System.currentTimeMillis();
@@ -127,13 +112,6 @@ public class TestLogsCleaner {
 
     assertEquals(34, fs.listStatus(oldLogDir).length);
 
-    // This will take care of 20 old log files (default max we can delete)
-    cleaner.chore();
-
-    assertEquals(14, fs.listStatus(oldLogDir).length);
-
-    // We will delete all remaining log files which are not scheduled for
-    // replication and those that are invalid
     cleaner.chore();
 
     // We end up with the current log file, a newer one and the 3 old log
@@ -141,8 +119,46 @@ public class TestLogsCleaner {
     assertEquals(5, fs.listStatus(oldLogDir).length);
 
     for (FileStatus file : fs.listStatus(oldLogDir)) {
-      System.out.println("Keeped log files: " + file.getPath().getName());
+      System.out.println("Kept log files: " + file.getPath().getName());
     }
   }
 
+  static class DummyServer implements Server {
+
+    @Override
+    public Configuration getConfiguration() {
+      return TEST_UTIL.getConfiguration();
+    }
+
+    @Override
+    public ZooKeeperWatcher getZooKeeper() {
+      try {
+        return new ZooKeeperWatcher(getConfiguration(), "dummy server", this);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+      return null;
+    }
+
+    @Override
+    public CatalogTracker getCatalogTracker() {
+      return null;
+    }
+
+    @Override
+    public String getServerName() {
+      return "regionserver,60020,000000";
+    }
+
+    @Override
+    public void abort(String why, Throwable e) {}
+
+    @Override
+    public void stop(String why) {}
+
+    @Override
+    public boolean isStopped() {
+      return false;
+    }
+  }
 }

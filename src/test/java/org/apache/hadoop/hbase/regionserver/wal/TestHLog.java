@@ -132,13 +132,17 @@ public class TestHLog  {
 
     final byte [] tableName = Bytes.toBytes(getName());
     final byte [] rowName = tableName;
-    Path logdir = new Path(dir, HConstants.HREGION_LOGDIR_NAME);
-    HLog log = new HLog(fs, logdir, oldLogDir, conf, null);
+    Path logdir = new Path(hbaseDir, HConstants.HREGION_LOGDIR_NAME);
+    HLog log = new HLog(fs, logdir, oldLogDir, conf);
     final int howmany = 3;
     HRegionInfo[] infos = new HRegionInfo[3];
+    Path tabledir = new Path(hbaseDir, getName());
+    fs.mkdirs(tabledir);
     for(int i = 0; i < howmany; i++) {
       infos[i] = new HRegionInfo(new HTableDescriptor(tableName),
                 Bytes.toBytes("" + i), Bytes.toBytes("" + (i+1)), false);
+      fs.mkdirs(new Path(tabledir, infos[i].getEncodedName()));
+      LOG.info("allo " + new Path(tabledir, infos[i].getEncodedName()).toString());
     }
     // Add edits for three regions.
     try {
@@ -160,9 +164,10 @@ public class TestHLog  {
         log.rollWriter();
       }
       log.close();
-      Path splitsdir = new Path(dir, "splits");
+      HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+          hbaseDir, logdir, this.oldLogDir, this.fs);
       List<Path> splits =
-        HLog.splitLog(splitsdir, logdir, oldLogDir, fs, conf);
+        logSplitter.splitLog();
       verifySplits(splits, howmany);
       log = null;
     } finally {
@@ -192,7 +197,7 @@ public class TestHLog  {
     out.close();
     in.close();
     Path subdir = new Path(dir, "hlogdir");
-    HLog wal = new HLog(fs, subdir, oldLogDir, conf, null);
+    HLog wal = new HLog(fs, subdir, oldLogDir, conf);
     final int total = 20;
 
     HRegionInfo info = new HRegionInfo(new HTableDescriptor(bytes),
@@ -257,28 +262,30 @@ public class TestHLog  {
   }
 
   /**
-   * Test the findMemstoresWithEditsOlderThan method.
+   * Test the findMemstoresWithEditsEqualOrOlderThan method.
    * @throws IOException
    */
   @Test
-  public void testFindMemstoresWithEditsOlderThan() throws IOException {
+  public void testFindMemstoresWithEditsEqualOrOlderThan() throws IOException {
     Map<byte [], Long> regionsToSeqids = new HashMap<byte [], Long>();
     for (int i = 0; i < 10; i++) {
       Long l = Long.valueOf(i);
       regionsToSeqids.put(l.toString().getBytes(), l);
     }
     byte [][] regions =
-      HLog.findMemstoresWithEditsOlderThan(1, regionsToSeqids);
-    assertEquals(1, regions.length);
-    assertTrue(Bytes.equals(regions[0], "0".getBytes()));
-    regions = HLog.findMemstoresWithEditsOlderThan(3, regionsToSeqids);
-    int count = 3;
+      HLog.findMemstoresWithEditsEqualOrOlderThan(1, regionsToSeqids);
+    assertEquals(2, regions.length);
+    assertTrue(Bytes.equals(regions[0], "0".getBytes()) ||
+        Bytes.equals(regions[0], "1".getBytes()));
+    regions = HLog.findMemstoresWithEditsEqualOrOlderThan(3, regionsToSeqids);
+    int count = 4;
     assertEquals(count, regions.length);
     // Regions returned are not ordered.
     for (int i = 0; i < count; i++) {
       assertTrue(Bytes.equals(regions[i], "0".getBytes()) ||
         Bytes.equals(regions[i], "1".getBytes()) ||
-        Bytes.equals(regions[i], "2".getBytes()));
+        Bytes.equals(regions[i], "2".getBytes()) ||
+        Bytes.equals(regions[i], "3".getBytes()));
     }
   }
 
@@ -295,7 +302,7 @@ public class TestHLog  {
         HLog.Entry entry = new HLog.Entry();
         while((entry = reader.next(entry)) != null) {
           HLogKey key = entry.getKey();
-          String region = Bytes.toString(key.getRegionName());
+          String region = Bytes.toString(key.getEncodedRegionName());
           // Assert that all edits are for same region.
           if (previousRegion != null) {
             assertEquals(previousRegion, region);
@@ -313,11 +320,11 @@ public class TestHLog  {
     }
   }
   
-  // For this test to pass, requires: 
+  // For this test to pass, requires:
   // 1. HDFS-200 (append support)
-  // 2. HDFS-988 (SafeMode should freeze file operations 
+  // 2. HDFS-988 (SafeMode should freeze file operations
   //              [FSNamesystem.nextGenerationStampForBlock])
-  // 3. HDFS-142 (on restart, maintain pendingCreates) 
+  // 3. HDFS-142 (on restart, maintain pendingCreates)
   @Test
   public void testAppendClose() throws Exception {
     byte [] tableName = Bytes.toBytes(getName());
@@ -325,7 +332,7 @@ public class TestHLog  {
         HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW, false);
     Path subdir = new Path(dir, "hlogdir");
     Path archdir = new Path(dir, "hlogdir_archive");
-    HLog wal = new HLog(fs, subdir, archdir, conf, null);
+    HLog wal = new HLog(fs, subdir, archdir, conf);
     final int total = 20;
 
     for (int i = 0; i < total; i++) {
@@ -344,7 +351,7 @@ public class TestHLog  {
       cluster.getNameNode().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
       cluster.shutdown();
       try {
-        // wal.writer.close() will throw an exception, 
+        // wal.writer.close() will throw an exception,
         // but still call this since it closes the LogSyncer thread first
         wal.close();
       } catch (IOException e) {
@@ -369,7 +376,7 @@ public class TestHLog  {
     Method setLeasePeriod = cluster.getClass()
       .getDeclaredMethod("setLeasePeriod", new Class[]{Long.TYPE, Long.TYPE});
     setLeasePeriod.setAccessible(true);
-    setLeasePeriod.invoke(cluster, 
+    setLeasePeriod.invoke(cluster,
                           new Object[]{new Long(1000), new Long(1000)});
     try {
       Thread.sleep(1000);
@@ -405,8 +412,8 @@ public class TestHLog  {
       throw t.exception;
 
     // Make sure you can read all the content
-    SequenceFile.Reader reader 
-      = new SequenceFile.Reader(fs, walPath, conf);
+    SequenceFile.Reader reader
+      = new SequenceFile.Reader(this.fs, walPath, this.conf);
     int count = 0;
     HLogKey key = HLog.newKey(conf);
     WALEdit val = new WALEdit();
@@ -429,7 +436,7 @@ public class TestHLog  {
     final byte [] tableName = Bytes.toBytes("tablename");
     final byte [] row = Bytes.toBytes("row");
     HLog.Reader reader = null;
-    HLog log = new HLog(fs, dir, oldLogDir, conf, null);
+    HLog log = new HLog(fs, dir, oldLogDir, conf);
     try {
       // Write columns named 1, 2, 3, etc. and then values of single byte
       // 1, 2, 3...
@@ -442,10 +449,9 @@ public class TestHLog  {
       }
       HRegionInfo info = new HRegionInfo(new HTableDescriptor(tableName),
         row,Bytes.toBytes(Bytes.toString(row) + "1"), false);
-      final byte [] regionName = info.getRegionName();
       log.append(info, tableName, cols, System.currentTimeMillis());
       long logSeqId = log.startCacheFlush();
-      log.completeCacheFlush(regionName, tableName, logSeqId, info.isMetaRegion());
+      log.completeCacheFlush(info.getEncodedNameAsBytes(), tableName, logSeqId, info.isMetaRegion());
       log.close();
       Path filename = log.computeFilename();
       log = null;
@@ -458,7 +464,7 @@ public class TestHLog  {
         if (entry == null) break;
         HLogKey key = entry.getKey();
         WALEdit val = entry.getEdit();
-        assertTrue(Bytes.equals(regionName, key.getRegionName()));
+        assertTrue(Bytes.equals(info.getEncodedNameAsBytes(), key.getEncodedRegionName()));
         assertTrue(Bytes.equals(tableName, key.getTablename()));
         KeyValue kv = val.getKeyValues().get(0);
         assertTrue(Bytes.equals(row, kv.getRow()));
@@ -470,7 +476,7 @@ public class TestHLog  {
         HLogKey key = entry.getKey();
         WALEdit val = entry.getEdit();
         // Assert only one more row... the meta flushed row.
-        assertTrue(Bytes.equals(regionName, key.getRegionName()));
+        assertTrue(Bytes.equals(info.getEncodedNameAsBytes(), key.getEncodedRegionName()));
         assertTrue(Bytes.equals(tableName, key.getTablename()));
         KeyValue kv = val.getKeyValues().get(0);
         assertTrue(Bytes.equals(HLog.METAROW, kv.getRow()));
@@ -498,7 +504,7 @@ public class TestHLog  {
     final byte [] tableName = Bytes.toBytes("tablename");
     final byte [] row = Bytes.toBytes("row");
     Reader reader = null;
-    HLog log = new HLog(fs, dir, oldLogDir, conf, null);
+    HLog log = new HLog(fs, dir, oldLogDir, conf);
     try {
       // Write columns named 1, 2, 3, etc. and then values of single byte
       // 1, 2, 3...
@@ -513,7 +519,7 @@ public class TestHLog  {
           HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
       log.append(hri, tableName, cols, System.currentTimeMillis());
       long logSeqId = log.startCacheFlush();
-      log.completeCacheFlush(hri.getRegionName(), tableName, logSeqId, false);
+      log.completeCacheFlush(hri.getEncodedNameAsBytes(), tableName, logSeqId, false);
       log.close();
       Path filename = log.computeFilename();
       log = null;
@@ -523,8 +529,8 @@ public class TestHLog  {
       assertEquals(COL_COUNT, entry.getEdit().size());
       int idx = 0;
       for (KeyValue val : entry.getEdit().getKeyValues()) {
-        assertTrue(Bytes.equals(hri.getRegionName(),
-          entry.getKey().getRegionName()));
+        assertTrue(Bytes.equals(hri.getEncodedNameAsBytes(),
+          entry.getKey().getEncodedRegionName()));
         assertTrue(Bytes.equals(tableName, entry.getKey().getTablename()));
         assertTrue(Bytes.equals(row, val.getRow()));
         assertEquals((byte)(idx + '0'), val.getValue()[0]);
@@ -536,8 +542,8 @@ public class TestHLog  {
       entry = reader.next();
       assertEquals(1, entry.getEdit().size());
       for (KeyValue val : entry.getEdit().getKeyValues()) {
-        assertTrue(Bytes.equals(hri.getRegionName(),
-          entry.getKey().getRegionName()));
+        assertTrue(Bytes.equals(hri.getEncodedNameAsBytes(),
+          entry.getKey().getEncodedRegionName()));
         assertTrue(Bytes.equals(tableName, entry.getKey().getTablename()));
         assertTrue(Bytes.equals(HLog.METAROW, val.getRow()));
         assertTrue(Bytes.equals(HLog.METAFAMILY, val.getFamily()));
@@ -564,9 +570,9 @@ public class TestHLog  {
     final int COL_COUNT = 10;
     final byte [] tableName = Bytes.toBytes("tablename");
     final byte [] row = Bytes.toBytes("row");
-    HLog log = new HLog(fs, dir, oldLogDir, conf, null);
-    DumbLogEntriesVisitor visitor = new DumbLogEntriesVisitor();
-    log.addLogEntryVisitor(visitor);
+    HLog log = new HLog(fs, dir, oldLogDir, conf);
+    DumbWALObserver visitor = new DumbWALObserver();
+    log.registerWALActionsListener(visitor);
     long timestamp = System.currentTimeMillis();
     HRegionInfo hri = new HRegionInfo(new HTableDescriptor(tableName),
         HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
@@ -578,7 +584,7 @@ public class TestHLog  {
       log.append(hri, tableName, cols, System.currentTimeMillis());
     }
     assertEquals(COL_COUNT, visitor.increments);
-    log.removeLogEntryVisitor(visitor);
+    log.unregisterWALActionsListener(visitor);
     WALEdit cols = new WALEdit();
     cols.add(new KeyValue(row, Bytes.toBytes("column"),
         Bytes.toBytes(Integer.toString(11)),
@@ -587,14 +593,88 @@ public class TestHLog  {
     assertEquals(COL_COUNT, visitor.increments);
   }
 
-  static class DumbLogEntriesVisitor implements LogEntryVisitor {
+  @Test
+  public void testLogCleaning() throws Exception {
+    LOG.info("testLogCleaning");
+    final byte [] tableName = Bytes.toBytes("testLogCleaning");
+    final byte [] tableName2 = Bytes.toBytes("testLogCleaning2");
 
+    HLog log = new HLog(fs, dir, oldLogDir, conf);
+    HRegionInfo hri = new HRegionInfo(new HTableDescriptor(tableName),
+        HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
+    HRegionInfo hri2 = new HRegionInfo(new HTableDescriptor(tableName2),
+        HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
+
+    // Add a single edit and make sure that rolling won't remove the file
+    // Before HBASE-3198 it used to delete it
+    addEdits(log, hri, tableName, 1);
+    log.rollWriter();
+    assertEquals(1, log.getNumLogFiles());
+
+    // See if there's anything wrong with more than 1 edit
+    addEdits(log, hri, tableName, 2);
+    log.rollWriter();
+    assertEquals(2, log.getNumLogFiles());
+
+    // Now mix edits from 2 regions, still no flushing
+    addEdits(log, hri, tableName, 1);
+    addEdits(log, hri2, tableName2, 1);
+    addEdits(log, hri, tableName, 1);
+    addEdits(log, hri2, tableName2, 1);
+    log.rollWriter();
+    assertEquals(3, log.getNumLogFiles());
+
+    // Flush the first region, we expect to see the first two files getting
+    // archived
+    long seqId = log.startCacheFlush();
+    log.completeCacheFlush(hri.getEncodedNameAsBytes(), tableName, seqId, false);
+    log.rollWriter();
+    assertEquals(2, log.getNumLogFiles());
+
+    // Flush the second region, which removes all the remaining output files
+    // since the oldest was completely flushed and the two others only contain
+    // flush information
+    seqId = log.startCacheFlush();
+    log.completeCacheFlush(hri2.getEncodedNameAsBytes(), tableName2, seqId, false);
+    log.rollWriter();
+    assertEquals(0, log.getNumLogFiles());
+  }
+
+  private void addEdits(HLog log, HRegionInfo hri, byte [] tableName,
+                        int times) throws IOException {
+    final byte [] row = Bytes.toBytes("row");
+    for (int i = 0; i < times; i++) {
+      long timestamp = System.currentTimeMillis();
+      WALEdit cols = new WALEdit();
+      cols.add(new KeyValue(row, row, row, timestamp, row));
+      log.append(hri, tableName, cols, timestamp);
+    }
+  }
+
+  static class DumbWALObserver implements WALObserver {
     int increments = 0;
 
     @Override
     public void visitLogEntryBeforeWrite(HRegionInfo info, HLogKey logKey,
                                          WALEdit logEdit) {
       increments++;
+    }
+
+    @Override
+    public void logRolled(Path newFile) {
+      // TODO Auto-generated method stub
+      
+    }
+
+    @Override
+    public void logRollRequested() {
+      // TODO Auto-generated method stub
+      
+    }
+
+    @Override
+    public void logCloseRequested() {
+      // not interested
     }
   }
 }

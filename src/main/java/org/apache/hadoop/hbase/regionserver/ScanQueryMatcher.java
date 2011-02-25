@@ -45,6 +45,7 @@ public class ScanQueryMatcher {
 
   /** Keeps track of deletes */
   protected DeleteTracker deletes;
+  protected boolean retainDeletesInOutput;
 
   /** Keeps track of columns and versions */
   protected ColumnTracker columns;
@@ -71,7 +72,8 @@ public class ScanQueryMatcher {
    */
   public ScanQueryMatcher(Scan scan, byte [] family,
       NavigableSet<byte[]> columns, long ttl,
-      KeyValue.KeyComparator rowComparator, int maxVersions) {
+      KeyValue.KeyComparator rowComparator, int maxVersions,
+      boolean retainDeletesInOutput) {
     this.tr = scan.getTimeRange();
     this.oldestStamp = System.currentTimeMillis() - ttl;
     this.rowComparator = rowComparator;
@@ -79,6 +81,7 @@ public class ScanQueryMatcher {
     this.stopRow = scan.getStopRow();
     this.startKey = KeyValue.createFirstOnRow(scan.getStartRow());
     this.filter = scan.getFilter();
+    this.retainDeletesInOutput = retainDeletesInOutput;
 
     // Single branch to deal with two types of reads (columns vs all in family)
     if (columns == null || columns.size() == 0) {
@@ -89,6 +92,13 @@ public class ScanQueryMatcher {
       // between rows, not between storefiles.
       this.columns = new ExplicitColumnTracker(columns,maxVersions);
     }
+  }
+  public ScanQueryMatcher(Scan scan, byte [] family,
+      NavigableSet<byte[]> columns, long ttl,
+      KeyValue.KeyComparator rowComparator, int maxVersions) {
+      /* By default we will not include deletes */
+      /* deletes are included explicitly (for minor compaction) */
+      this(scan, family, columns, ttl, rowComparator, maxVersions, false);
   }
 
   /**
@@ -159,16 +169,22 @@ public class ScanQueryMatcher {
         this.deletes.add(bytes, offset, qualLength, timestamp, type);
         // Can't early out now, because DelFam come before any other keys
       }
+      if (retainDeletesInOutput) {
+        return MatchCode.INCLUDE;
+      }
+      else {
+        return MatchCode.SKIP;
+      }
+    }
+
+    if (!this.deletes.isEmpty() &&
+        deletes.isDeleted(bytes, offset, qualLength, timestamp)) {
+
       // May be able to optimize the SKIP here, if we matched
       // due to a DelFam, we can skip to next row
       // due to a DelCol, we can skip to next col
       // But it requires more info out of isDelete().
       // needful -> million column challenge.
-      return MatchCode.SKIP;
-    }
-
-    if (!this.deletes.isEmpty() &&
-        deletes.isDeleted(bytes, offset, qualLength, timestamp)) {
       return MatchCode.SKIP;
     }
 
@@ -199,18 +215,16 @@ public class ScanQueryMatcher {
       }
     }
 
-    MatchCode colChecker = columns.checkColumn(bytes, offset, qualLength);
-    // if SKIP -> SEEK_NEXT_COL
-    // if (NEXT,DONE) -> SEEK_NEXT_ROW
-    // if (INCLUDE) -> INCLUDE
-    if (colChecker == MatchCode.SKIP) {
-      return MatchCode.SEEK_NEXT_COL;
-    } else if (colChecker == MatchCode.NEXT || colChecker == MatchCode.DONE) {
+    MatchCode colChecker = columns.checkColumn(bytes, offset, qualLength, timestamp);
+    /*
+     * According to current implementation, colChecker can only be
+     * SEEK_NEXT_COL, SEEK_NEXT_ROW, SKIP or INCLUDE. Therefore, always return
+     * the MatchCode. If it is SEEK_NEXT_ROW, also set stickyNextRow.
+     */
+    if (colChecker == MatchCode.SEEK_NEXT_ROW) {
       stickyNextRow = true;
-      return MatchCode.SEEK_NEXT_ROW;
     }
-
-    return MatchCode.INCLUDE;
+    return colChecker;
 
   }
 
@@ -235,6 +249,8 @@ public class ScanQueryMatcher {
     if (!Bytes.equals(stopRow , HConstants.EMPTY_END_ROW) &&
         rowComparator.compareRows(kv.getBuffer(),kv.getRowOffset(),
             kv.getRowLength(), stopRow, 0, stopRow.length) >= 0) {
+      // KV >= STOPROW
+      // then NO there is nothing left.
       return false;
     } else {
       return true;
@@ -280,6 +296,28 @@ public class ScanQueryMatcher {
     } else {
       return filter.getNextKeyHint(kv);
     }
+  }
+
+  public KeyValue getKeyForNextColumn(KeyValue kv) {
+    ColumnCount nextColumn = columns.getColumnHint();
+    if (nextColumn == null) {
+      return KeyValue.createLastOnRow(
+          kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
+          kv.getBuffer(), kv.getFamilyOffset(), kv.getFamilyLength(),
+          kv.getBuffer(), kv.getQualifierOffset(), kv.getQualifierLength());
+    } else {
+      return KeyValue.createFirstOnRow(
+          kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
+          kv.getBuffer(), kv.getFamilyOffset(), kv.getFamilyLength(),
+          nextColumn.getBuffer(), nextColumn.getOffset(), nextColumn.getLength());
+    }
+  }
+
+  public KeyValue getKeyForNextRow(KeyValue kv) {
+    return KeyValue.createLastOnRow(
+        kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
+        null, 0, 0,
+        null, 0, 0);
   }
 
   /**

@@ -43,6 +43,7 @@ import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
@@ -247,12 +248,12 @@ public class TestHFileOutputFormat  {
     }
     return ret;
   }
-  
+
   @Test
   public void testMRIncrementalLoad() throws Exception {
     doIncrementalLoadTest(false);
   }
-  
+
   @Test
   public void testMRIncrementalLoadWithSplit() throws Exception {
     doIncrementalLoadTest(true);
@@ -286,6 +287,11 @@ public class TestHFileOutputFormat  {
       if (shouldChangeRegions) {
         LOG.info("Changing regions in table");
         admin.disableTable(table.getTableName());
+        while(util.getMiniHBaseCluster().getMaster().getAssignmentManager().
+            isRegionsInTransition()) {
+          Threads.sleep(1000);
+          LOG.info("Waiting on table to finish disabling");
+        }
         byte[][] newStartKeys = generateRandomStartKeys(15);
         util.createMultiRegions(util.getConfiguration(),
             table, FAMILY_NAME, newStartKeys);
@@ -308,13 +314,12 @@ public class TestHFileOutputFormat  {
             
       // Cause regions to reopen
       admin.disableTable(TABLE_NAME);
-      while (table.getRegionsInfo().size() != 0) {
+      while (!admin.isTableDisabled(TABLE_NAME)) {
         Thread.sleep(1000);
         LOG.info("Waiting for table to disable"); 
       }
       admin.enableTable(TABLE_NAME);
       util.waitTableAvailable(TABLE_NAME, 30000);
-      
       assertEquals("Data should remain after reopening of regions",
           tableDigestBefore, util.checksumRows(table));
     } finally {
@@ -322,9 +327,7 @@ public class TestHFileOutputFormat  {
       util.shutdownMiniCluster();
     }
   }
-  
-  
-  
+
   private void runIncrementalPELoad(
       Configuration conf, HTable table, Path outDir)
   throws Exception {

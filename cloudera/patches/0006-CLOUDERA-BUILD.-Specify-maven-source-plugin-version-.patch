@@ -1,0 +1,26 @@
+From d8fff4b8c5968c93a107266665a33bc725c2ee1c Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Mon, 14 Feb 2011 18:31:10 -0800
+Subject: [PATCH 6/9] CLOUDERA-BUILD. Specify maven-source-plugin version as 2.1.2
+
+Upstream this is inherited from the Apache parent pom, but the
+Cloudera parent pom specifies an older version.
+---
+ pom.xml |    1 +
+ 1 files changed, 1 insertions(+), 0 deletions(-)
+
+diff --git a/pom.xml b/pom.xml
+index 65af03c..8bd1ef4 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -356,6 +356,7 @@
+       <plugin>
+         <groupId>org.apache.maven.plugins</groupId>
+         <artifactId>maven-source-plugin</artifactId>
++        <version>2.1.2</version>
+         <executions>
+           <execution>
+             <id>attach-sources</id>
+-- 
+1.7.0.4
+

@@ -25,9 +25,9 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import java.io.File;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -35,13 +35,13 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.UUID;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
@@ -53,6 +53,7 @@ import org.apache.hadoop.hbase.filter.BinaryComparator;
 import org.apache.hadoop.hbase.filter.CompareFilter;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterList;
+import org.apache.hadoop.hbase.filter.KeyOnlyFilter;
 import org.apache.hadoop.hbase.filter.PrefixFilter;
 import org.apache.hadoop.hbase.filter.QualifierFilter;
 import org.apache.hadoop.hbase.filter.RegexStringComparator;
@@ -122,7 +123,7 @@ public class TestFromClientSide {
     byte[] TABLE = Bytes.toBytes("testGetConfiguration");
     byte[][] FAMILIES = new byte[][] { Bytes.toBytes("foo") };
     Configuration conf = TEST_UTIL.getConfiguration();
-    HTable table = TEST_UTIL.createTable(TABLE, FAMILIES);
+    HTable table = TEST_UTIL.createTable(TABLE, FAMILIES, conf);
     assertSame(conf, table.getConfiguration());
   }
 
@@ -151,8 +152,7 @@ public class TestFromClientSide {
     putRows(ht, 3, value2, keyPrefix1);
     putRows(ht, 3, value2, keyPrefix2);
     putRows(ht, 3, value2, keyPrefix3);
-    HTable table = new HTable(TEST_UTIL.getConfiguration(),
-      Bytes.toBytes("testWeirdCacheBehaviour"));
+    HTable table = new HTable(TEST_UTIL.getConfiguration(), TABLE);
     System.out.println("Checking values for key: " + keyPrefix1);
     assertEquals("Got back incorrect number of rows from scan", 3,
         getNumberOfRows(keyPrefix1, value2, table));
@@ -262,9 +262,11 @@ public class TestFromClientSide {
    * logs to ensure that we're not scanning more regions that we're supposed to.
    * Related to the TestFilterAcrossRegions over in the o.a.h.h.filter package.
    * @throws IOException
+   * @throws InterruptedException
    */
   @Test
-  public void testFilterAcrossMutlipleRegions() throws IOException {
+  public void testFilterAcrossMultipleRegions()
+  throws IOException, InterruptedException {
     byte [] name = Bytes.toBytes("testFilterAcrossMutlipleRegions");
     HTable t = TEST_UTIL.createTable(name, FAMILY);
     int rowCount = TEST_UTIL.loadTable(t, FAMILY);
@@ -313,32 +315,6 @@ public class TestFromClientSide {
     countGreater = countRows(t, createScanWithRowFilter(endKey, endKey,
       CompareFilter.CompareOp.GREATER_OR_EQUAL));
     assertEquals(rowCount - endKeyCount, countGreater);
-  }
-  
-  /*
-   * Load table with rows from 'aaa' to 'zzz'.
-   * @param t
-   * @return Count of rows loaded.
-   * @throws IOException
-   */
-  private int loadTable(final HTable t) throws IOException {
-    // Add data to table.
-    byte[] k = new byte[3];
-    int rowCount = 0;
-    for (byte b1 = 'a'; b1 < 'z'; b1++) {
-      for (byte b2 = 'a'; b2 < 'z'; b2++) {
-        for (byte b3 = 'a'; b3 < 'z'; b3++) {
-          k[0] = b1;
-          k[1] = b2;
-          k[2] = b3;
-          Put put = new Put(k);
-          put.add(FAMILY, new byte[0], k);
-          t.put(put);
-          rowCount++;
-        }
-      }
-    }
-    return rowCount;
   }
 
   /*
@@ -399,7 +375,7 @@ public class TestFromClientSide {
    * @throws IOException
    */
   private Map<HRegionInfo, HServerAddress> splitTable(final HTable t)
-  throws IOException {
+  throws IOException, InterruptedException {
     // Split this table in two.
     HBaseAdmin admin = new HBaseAdmin(TEST_UTIL.getConfiguration());
     admin.split(t.getTableName());
@@ -421,7 +397,7 @@ public class TestFromClientSide {
     for (int i = 0; i < TEST_UTIL.getConfiguration().getInt("hbase.test.retries", 30); i++) {
       Thread.currentThread();
       try {
-        Thread.sleep(TEST_UTIL.getConfiguration().getInt("hbase.server.thread.wakefrequency", 1000));
+        Thread.sleep(1000);
       } catch (InterruptedException e) {
         e.printStackTrace();
       }
@@ -504,6 +480,39 @@ public class TestFromClientSide {
     scanner.close();
   }
 
+  @Test
+  public void testKeyOnlyFilter() throws Exception {
+    byte [] TABLE = Bytes.toBytes("testKeyOnlyFilter");
+    HTable ht = TEST_UTIL.createTable(TABLE, FAMILY);
+    byte [][] ROWS = makeN(ROW, 10);
+    byte [][] QUALIFIERS = {
+        Bytes.toBytes("col0-<d2v1>-<d3v2>"), Bytes.toBytes("col1-<d2v1>-<d3v2>"),
+        Bytes.toBytes("col2-<d2v1>-<d3v2>"), Bytes.toBytes("col3-<d2v1>-<d3v2>"),
+        Bytes.toBytes("col4-<d2v1>-<d3v2>"), Bytes.toBytes("col5-<d2v1>-<d3v2>"),
+        Bytes.toBytes("col6-<d2v1>-<d3v2>"), Bytes.toBytes("col7-<d2v1>-<d3v2>"),
+        Bytes.toBytes("col8-<d2v1>-<d3v2>"), Bytes.toBytes("col9-<d2v1>-<d3v2>")
+    };
+    for(int i=0;i<10;i++) {
+      Put put = new Put(ROWS[i]);
+      put.add(FAMILY, QUALIFIERS[i], VALUE);
+      ht.put(put);
+    }
+    Scan scan = new Scan();
+    scan.addFamily(FAMILY);
+    Filter filter = new KeyOnlyFilter(true);
+    scan.setFilter(filter);
+    ResultScanner scanner = ht.getScanner(scan);
+    int count = 0;
+    for(Result result : ht.getScanner(scan)) {
+      assertEquals(result.size(), 1);
+      assertEquals(result.raw()[0].getValueLength(), Bytes.SIZEOF_INT);
+      assertEquals(Bytes.toInt(result.raw()[0].getValue()), VALUE.length);
+      count++;
+    }
+    assertEquals(count, 10);
+    scanner.close();
+  }
+  
   /**
    * Test simple table and non-existent row cases.
    */
@@ -1531,7 +1540,7 @@ public class TestFromClientSide {
     get.addFamily(FAMILIES[0]);
     get.setMaxVersions(Integer.MAX_VALUE);
     result = ht.get(get);
-    assertNResult(result, ROW, FAMILIES[0], QUALIFIER, 
+    assertNResult(result, ROW, FAMILIES[0], QUALIFIER,
         new long [] {ts[1], ts[2], ts[3]},
         new byte[][] {VALUES[1], VALUES[2], VALUES[3]},
         0, 2);
@@ -2658,6 +2667,23 @@ public class TestFromClientSide {
         equals(value, key.getValue()));
   }
 
+  private void assertIncrementKey(KeyValue key, byte [] row, byte [] family,
+      byte [] qualifier, long value)
+  throws Exception {
+    assertTrue("Expected row [" + Bytes.toString(row) + "] " +
+        "Got row [" + Bytes.toString(key.getRow()) +"]",
+        equals(row, key.getRow()));
+    assertTrue("Expected family [" + Bytes.toString(family) + "] " +
+        "Got family [" + Bytes.toString(key.getFamily()) + "]",
+        equals(family, key.getFamily()));
+    assertTrue("Expected qualifier [" + Bytes.toString(qualifier) + "] " +
+        "Got qualifier [" + Bytes.toString(key.getQualifier()) + "]",
+        equals(qualifier, key.getQualifier()));
+    assertTrue("Expected value [" + value + "] " +
+        "Got value [" + Bytes.toLong(key.getValue()) + "]",
+        Bytes.toLong(key.getValue()) == value);
+  }
+
   private void assertNumKeys(Result result, int n) throws Exception {
     assertTrue("Expected " + n + " keys but got " + result.size(),
         result.size() == n);
@@ -2869,7 +2895,7 @@ public class TestFromClientSide {
     return Bytes.equals(left, right);
   }
 
-  @Ignore @Test
+  @Test
   public void testDuplicateVersions() throws Exception {
     byte [] TABLE = Bytes.toBytes("testDuplicateVersions");
 
@@ -3069,18 +3095,198 @@ public class TestFromClientSide {
     get.setMaxVersions(Integer.MAX_VALUE);
     result = ht.get(get);
     assertNResult(result, ROW, FAMILY, QUALIFIER,
-        new long [] {STAMPS[3], STAMPS[4], STAMPS[5], STAMPS[6], STAMPS[8], STAMPS[9], STAMPS[13], STAMPS[15]},
-        new byte[][] {VALUES[3], VALUES[14], VALUES[5], VALUES[6], VALUES[8], VALUES[9], VALUES[13], VALUES[15]},
-        0, 7);
+        new long [] {STAMPS[1], STAMPS[2], STAMPS[3], STAMPS[4], STAMPS[5], STAMPS[6], STAMPS[8], STAMPS[9], STAMPS[13], STAMPS[15]},
+        new byte[][] {VALUES[1], VALUES[2], VALUES[3], VALUES[14], VALUES[5], VALUES[6], VALUES[8], VALUES[9], VALUES[13], VALUES[15]},
+        0, 9);
 
     scan = new Scan(ROW);
     scan.addColumn(FAMILY, QUALIFIER);
     scan.setMaxVersions(Integer.MAX_VALUE);
     result = getSingleScanResult(ht, scan);
     assertNResult(result, ROW, FAMILY, QUALIFIER,
-        new long [] {STAMPS[3], STAMPS[4], STAMPS[5], STAMPS[6], STAMPS[8], STAMPS[9], STAMPS[13], STAMPS[15]},
-        new byte[][] {VALUES[3], VALUES[14], VALUES[5], VALUES[6], VALUES[8], VALUES[9], VALUES[13], VALUES[15]},
-        0, 7);
+        new long [] {STAMPS[1], STAMPS[2], STAMPS[3], STAMPS[4], STAMPS[5], STAMPS[6], STAMPS[8], STAMPS[9], STAMPS[13], STAMPS[15]},
+        new byte[][] {VALUES[1], VALUES[2], VALUES[3], VALUES[14], VALUES[5], VALUES[6], VALUES[8], VALUES[9], VALUES[13], VALUES[15]},
+        0, 9);
+  }
+
+  @Test
+  public void testUpdates() throws Exception {
+
+    byte [] TABLE = Bytes.toBytes("testUpdates");
+    HTable hTable = TEST_UTIL.createTable(TABLE, FAMILY, 10);
+
+    // Write a column with values at timestamp 1, 2 and 3
+    byte[] row = Bytes.toBytes("row1");
+    byte[] qualifier = Bytes.toBytes("myCol");
+    Put put = new Put(row);
+    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("AAA"));
+    hTable.put(put);
+
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 2L, Bytes.toBytes("BBB"));
+    hTable.put(put);
+
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 3L, Bytes.toBytes("EEE"));
+    hTable.put(put);
+
+    Get get = new Get(row);
+    get.addColumn(FAMILY, qualifier);
+    get.setMaxVersions();
+
+    // Check that the column indeed has the right values at timestamps 1 and
+    // 2
+    Result result = hTable.get(get);
+    NavigableMap<Long, byte[]> navigableMap =
+        result.getMap().get(FAMILY).get(qualifier);
+    assertEquals("AAA", Bytes.toString(navigableMap.get(1L)));
+    assertEquals("BBB", Bytes.toString(navigableMap.get(2L)));
+
+    // Update the value at timestamp 1
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("CCC"));
+    hTable.put(put);
+
+    // Update the value at timestamp 2
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 2L, Bytes.toBytes("DDD"));
+    hTable.put(put);
+
+    // Check that the values at timestamp 2 and 1 got updated
+    result = hTable.get(get);
+    navigableMap = result.getMap().get(FAMILY).get(qualifier);
+    assertEquals("CCC", Bytes.toString(navigableMap.get(1L)));
+    assertEquals("DDD", Bytes.toString(navigableMap.get(2L)));
+  }
+
+  @Test
+  public void testUpdatesWithMajorCompaction() throws Exception {
+
+    String tableName = "testUpdatesWithMajorCompaction";
+    byte [] TABLE = Bytes.toBytes(tableName);
+    HTable hTable = TEST_UTIL.createTable(TABLE, FAMILY, 10);
+    HBaseAdmin admin = new HBaseAdmin(TEST_UTIL.getConfiguration());
+
+    // Write a column with values at timestamp 1, 2 and 3
+    byte[] row = Bytes.toBytes("row2");
+    byte[] qualifier = Bytes.toBytes("myCol");
+    Put put = new Put(row);
+    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("AAA"));
+    hTable.put(put);
+
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 2L, Bytes.toBytes("BBB"));
+    hTable.put(put);
+
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 3L, Bytes.toBytes("EEE"));
+    hTable.put(put);
+
+    Get get = new Get(row);
+    get.addColumn(FAMILY, qualifier);
+    get.setMaxVersions();
+
+    // Check that the column indeed has the right values at timestamps 1 and
+    // 2
+    Result result = hTable.get(get);
+    NavigableMap<Long, byte[]> navigableMap =
+        result.getMap().get(FAMILY).get(qualifier);
+    assertEquals("AAA", Bytes.toString(navigableMap.get(1L)));
+    assertEquals("BBB", Bytes.toString(navigableMap.get(2L)));
+
+    // Trigger a major compaction
+    admin.flush(tableName);
+    admin.majorCompact(tableName);
+    Thread.sleep(6000);
+
+    // Update the value at timestamp 1
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("CCC"));
+    hTable.put(put);
+
+    // Update the value at timestamp 2
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 2L, Bytes.toBytes("DDD"));
+    hTable.put(put);
+
+    // Trigger a major compaction
+    admin.flush(tableName);
+    admin.majorCompact(tableName);
+    Thread.sleep(6000);
+
+    // Check that the values at timestamp 2 and 1 got updated
+    result = hTable.get(get);
+    navigableMap = result.getMap().get(FAMILY).get(qualifier);
+    assertEquals("CCC", Bytes.toString(navigableMap.get(1L)));
+    assertEquals("DDD", Bytes.toString(navigableMap.get(2L)));
+  }
+
+  @Test
+  public void testMajorCompactionBetweenTwoUpdates() throws Exception {
+
+    String tableName = "testMajorCompactionBetweenTwoUpdates";
+    byte [] TABLE = Bytes.toBytes(tableName);
+    HTable hTable = TEST_UTIL.createTable(TABLE, FAMILY, 10);
+    HBaseAdmin admin = new HBaseAdmin(TEST_UTIL.getConfiguration());
+
+    // Write a column with values at timestamp 1, 2 and 3
+    byte[] row = Bytes.toBytes("row3");
+    byte[] qualifier = Bytes.toBytes("myCol");
+    Put put = new Put(row);
+    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("AAA"));
+    hTable.put(put);
+
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 2L, Bytes.toBytes("BBB"));
+    hTable.put(put);
+
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 3L, Bytes.toBytes("EEE"));
+    hTable.put(put);
+
+    Get get = new Get(row);
+    get.addColumn(FAMILY, qualifier);
+    get.setMaxVersions();
+
+    // Check that the column indeed has the right values at timestamps 1 and
+    // 2
+    Result result = hTable.get(get);
+    NavigableMap<Long, byte[]> navigableMap =
+        result.getMap().get(FAMILY).get(qualifier);
+    assertEquals("AAA", Bytes.toString(navigableMap.get(1L)));
+    assertEquals("BBB", Bytes.toString(navigableMap.get(2L)));
+
+    // Trigger a major compaction
+    admin.flush(tableName);
+    admin.majorCompact(tableName);
+    Thread.sleep(6000);
+
+    // Update the value at timestamp 1
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("CCC"));
+    hTable.put(put);
+
+    // Trigger a major compaction
+    admin.flush(tableName);
+    admin.majorCompact(tableName);
+    Thread.sleep(6000);
+
+    // Update the value at timestamp 2
+    put = new Put(row);
+    put.add(FAMILY, qualifier, 2L, Bytes.toBytes("DDD"));
+    hTable.put(put);
+
+    // Trigger a major compaction
+    admin.flush(tableName);
+    admin.majorCompact(tableName);
+    Thread.sleep(6000);
+
+    // Check that the values at timestamp 2 and 1 got updated
+    result = hTable.get(get);
+    navigableMap = result.getMap().get(FAMILY).get(qualifier);
+
+    assertEquals("CCC", Bytes.toString(navigableMap.get(1L)));
+    assertEquals("DDD", Bytes.toString(navigableMap.get(2L)));
   }
 
   @Test
@@ -3376,7 +3582,7 @@ public class TestFromClientSide {
   }
 
   @Test
-  public void testListTables() throws IOException {
+  public void testListTables() throws IOException, InterruptedException {
     byte [] t1 = Bytes.toBytes("testListTables1");
     byte [] t2 = Bytes.toBytes("testListTables2");
     byte [] t3 = Bytes.toBytes("testListTables3");
@@ -3459,7 +3665,7 @@ public class TestFromClientSide {
     for (HColumnDescriptor c : desc.getFamilies())
       c.setValue(attrName, attrValue);
     // update metadata for all regions of this table
-    admin.modifyTable(tableAname, HConstants.Modify.TABLE_SET_HTD, desc);
+    admin.modifyTable(tableAname, desc);
     // enable the table
     admin.enableTable(tableAname);
 
@@ -3531,10 +3737,11 @@ public class TestFromClientSide {
     assertTrue(Bytes.equals(result.getValue(HConstants.CATALOG_FAMILY, null), one));
   }
 
-    /**
+  /**
    * For HBASE-2156
    * @throws Exception
    */
+  @Test
   public void testScanVariableReuse() throws Exception {
     Scan scan = new Scan();
     scan.addFamily(FAMILY);
@@ -3545,7 +3752,8 @@ public class TestFromClientSide {
     scan = new Scan();
     scan.addFamily(FAMILY);
 
-    assertTrue(scan.getFamilyMap().get(FAMILY).size() == 0);
+    assertTrue(scan.getFamilyMap().get(FAMILY) == null);
+    assertTrue(scan.getFamilyMap().containsKey(FAMILY));
   }
 
   /**
@@ -3643,7 +3851,7 @@ public class TestFromClientSide {
     table.getConnection().clearRegionCache();
     assertEquals("Clearing cache should have 0 cached ", 0,
         HConnectionManager.getCachedRegionCount(conf, TABLENAME));
-    
+
     // A Get is suppose to do a region lookup request
     Get g = new Get(Bytes.toBytes("aaa"));
     table.get(g);
@@ -3674,22 +3882,93 @@ public class TestFromClientSide {
     Get g2 = new Get(Bytes.toBytes("bbb"));
     table.get(g2);
 
-    // Get the configured number of cache read-ahead regions.  For various
-    // reasons, the meta may not yet have all regions in place (e.g. hbase-2757). 
-    // That the prefetch gets at least half shows prefetch is bascially working.
-    int prefetchRegionNumber = conf.getInt("hbase.client.prefetch.limit", 10) / 2;
+    // Get the configured number of cache read-ahead regions.
+    int prefetchRegionNumber = conf.getInt("hbase.client.prefetch.limit", 10);
 
     // the total number of cached regions == region('aaa") + prefeched regions.
     LOG.info("Testing how many regions cached");
-    assertTrue(prefetchRegionNumber < HConnectionManager.getCachedRegionCount(conf, TABLENAME));
+    assertEquals("Number of cached region is incorrect ", prefetchRegionNumber,
+        HConnectionManager.getCachedRegionCount(conf, TABLENAME));
 
     table.getConnection().clearRegionCache();
 
     Get g3 = new Get(Bytes.toBytes("abc"));
     table.get(g3);
-    assertTrue(prefetchRegionNumber < HConnectionManager.getCachedRegionCount(conf, TABLENAME));
+    assertEquals("Number of cached region is incorrect ", prefetchRegionNumber,
+        HConnectionManager.getCachedRegionCount(conf, TABLENAME));
 
     LOG.info("Finishing testRegionCachePreWarm");
+  }
+
+  @Test
+  public void testIncrement() throws Exception {
+    LOG.info("Starting testIncrement");
+    final byte [] TABLENAME = Bytes.toBytes("testIncrement");
+    HTable ht = TEST_UTIL.createTable(TABLENAME, FAMILY);
+
+    byte [][] ROWS = new byte [][] {
+        Bytes.toBytes("a"), Bytes.toBytes("b"), Bytes.toBytes("c"),
+        Bytes.toBytes("d"), Bytes.toBytes("e"), Bytes.toBytes("f"),
+        Bytes.toBytes("g"), Bytes.toBytes("h"), Bytes.toBytes("i")
+    };
+    byte [][] QUALIFIERS = new byte [][] {
+        Bytes.toBytes("a"), Bytes.toBytes("b"), Bytes.toBytes("c"),
+        Bytes.toBytes("d"), Bytes.toBytes("e"), Bytes.toBytes("f"),
+        Bytes.toBytes("g"), Bytes.toBytes("h"), Bytes.toBytes("i")
+    };
+
+    // Do some simple single-column increments
+
+    // First with old API
+    ht.incrementColumnValue(ROW, FAMILY, QUALIFIERS[0], 1);
+    ht.incrementColumnValue(ROW, FAMILY, QUALIFIERS[1], 2);
+    ht.incrementColumnValue(ROW, FAMILY, QUALIFIERS[2], 3);
+    ht.incrementColumnValue(ROW, FAMILY, QUALIFIERS[3], 4);
+
+    // Now increment things incremented with old and do some new
+    Increment inc = new Increment(ROW);
+    inc.addColumn(FAMILY, QUALIFIERS[1], 1);
+    inc.addColumn(FAMILY, QUALIFIERS[3], 1);
+    inc.addColumn(FAMILY, QUALIFIERS[4], 1);
+    ht.increment(inc);
+
+    // Verify expected results
+    Result r = ht.get(new Get(ROW));
+    KeyValue [] kvs = r.raw();
+    assertEquals(5, kvs.length);
+    assertIncrementKey(kvs[0], ROW, FAMILY, QUALIFIERS[0], 1);
+    assertIncrementKey(kvs[1], ROW, FAMILY, QUALIFIERS[1], 3);
+    assertIncrementKey(kvs[2], ROW, FAMILY, QUALIFIERS[2], 3);
+    assertIncrementKey(kvs[3], ROW, FAMILY, QUALIFIERS[3], 5);
+    assertIncrementKey(kvs[4], ROW, FAMILY, QUALIFIERS[4], 1);
+
+    // Now try multiple columns by different amounts
+    inc = new Increment(ROWS[0]);
+    for (int i=0;i<QUALIFIERS.length;i++) {
+      inc.addColumn(FAMILY, QUALIFIERS[i], i+1);
+    }
+    ht.increment(inc);
+    // Verify
+    r = ht.get(new Get(ROWS[0]));
+    kvs = r.raw();
+    assertEquals(QUALIFIERS.length, kvs.length);
+    for (int i=0;i<QUALIFIERS.length;i++) {
+      assertIncrementKey(kvs[i], ROWS[0], FAMILY, QUALIFIERS[i], i+1);
+    }
+
+    // Re-increment them
+    inc = new Increment(ROWS[0]);
+    for (int i=0;i<QUALIFIERS.length;i++) {
+      inc.addColumn(FAMILY, QUALIFIERS[i], i+1);
+    }
+    ht.increment(inc);
+    // Verify
+    r = ht.get(new Get(ROWS[0]));
+    kvs = r.raw();
+    assertEquals(QUALIFIERS.length, kvs.length);
+    for (int i=0;i<QUALIFIERS.length;i++) {
+      assertIncrementKey(kvs[i], ROWS[0], FAMILY, QUALIFIERS[i], 2*(i+1));
+    }
   }
 }
 

@@ -19,13 +19,18 @@
  */
 package org.apache.hadoop.hbase.replication.regionserver;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Result;
@@ -40,21 +45,10 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-
 public class TestReplicationSink {
-
-  private static final Log LOG =
-      LogFactory.getLog(TestReplicationSink.class);
-
+  private static final Log LOG = LogFactory.getLog(TestReplicationSink.class);
   private static final int BATCH_SIZE = 10;
-
   private static final long SLEEP_TIME = 500;
-
-  private final static Configuration conf = HBaseConfiguration.create();
 
   private final static HBaseTestingUtility TEST_UTIL =
       new HBaseTestingUtility();
@@ -69,9 +63,22 @@ public class TestReplicationSink {
   private static final byte[] FAM_NAME1 = Bytes.toBytes("info1");
   private static final byte[] FAM_NAME2 = Bytes.toBytes("info2");
 
-  private static final AtomicBoolean STOPPER = new AtomicBoolean(false);
-
   private static HTable table1;
+  private static Stoppable STOPPABLE = new Stoppable() {
+    final AtomicBoolean stop = new AtomicBoolean(false);
+
+    @Override
+    public boolean isStopped() {
+      return this.stop.get();
+    }
+
+    @Override
+    public void stop(String why) {
+      LOG.info("STOPPING BECAUSE: " + why);
+      this.stop.set(true);
+    }
+    
+  };
 
   private static HTable table2;
 
@@ -81,11 +88,10 @@ public class TestReplicationSink {
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     TEST_UTIL.getConfiguration().setBoolean("dfs.support.append", true);
-    TEST_UTIL.getConfiguration().setBoolean(
-        HConstants.REPLICATION_ENABLE_KEY, true);
+    TEST_UTIL.getConfiguration().setBoolean(HConstants.REPLICATION_ENABLE_KEY, true);
     TEST_UTIL.startMiniCluster(3);
-    conf.setBoolean("dfs.support.append", true);
-    SINK = new ReplicationSink(conf,STOPPER);
+    SINK =
+      new ReplicationSink(new Configuration(TEST_UTIL.getConfiguration()), STOPPABLE);
     table1 = TEST_UTIL.createTable(TABLE_NAME1, FAM_NAME1);
     table2 = TEST_UTIL.createTable(TABLE_NAME2, FAM_NAME2);
   }
@@ -95,7 +101,7 @@ public class TestReplicationSink {
    */
   @AfterClass
   public static void tearDownAfterClass() throws Exception {
-    STOPPER.set(true);
+    STOPPABLE.stop("Shutting down");
     TEST_UTIL.shutdownMiniCluster();
   }
 

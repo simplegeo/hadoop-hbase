@@ -72,8 +72,16 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   }
 
   public static final String COMPRESSION = "COMPRESSION";
+  public static final String COMPRESSION_COMPACT = "COMPRESSION_COMPACT";
   public static final String BLOCKCACHE = "BLOCKCACHE";
+  
+  /**
+   * Size of storefile/hfile 'blocks'.  Default is {@link #DEFAULT_BLOCKSIZE}.
+   * Use smaller block sizes for faster random-access at expense of larger
+   * indices (more memory consumption).
+   */
   public static final String BLOCKSIZE = "BLOCKSIZE";
+
   public static final String LENGTH = "LENGTH";
   public static final String TTL = "TTL";
   public static final String BLOOMFILTER = "BLOOMFILTER";
@@ -108,8 +116,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   public static final boolean DEFAULT_BLOCKCACHE = true;
 
   /**
-   * Default size of blocks in files store to the filesytem.  Use smaller for
-   * faster random-access at expense of larger indices (more memory consumption).
+   * Default size of blocks in files stored to the filesytem (hfiles).
    */
   public static final int DEFAULT_BLOCKSIZE = HFile.DEFAULT_BLOCKSIZE;
 
@@ -223,7 +230,9 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
    * @param inMemory If true, column data should be kept in an HRegionServer's
    * cache
    * @param blockCacheEnabled If true, MapFile blocks should be cached
-   * @param blocksize
+   * @param blocksize Block size to use when writing out storefiles.  Use
+   * smaller blocksizes for faster random-access at expense of larger indices
+   * (more memory consumption).  Default is usually 64k.
    * @param timeToLive Time-to-live of cell contents, in seconds
    * (use HConstants.FOREVER for unlimited TTL)
    * @param bloomFilter Bloom filter type for this column
@@ -354,6 +363,19 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   /** @return compression type being used for the column family */
   public Compression.Algorithm getCompression() {
     String n = getValue(COMPRESSION);
+    if (n == null) {
+      return Compression.Algorithm.NONE;
+    }
+    return Compression.Algorithm.valueOf(n.toUpperCase());
+  }
+
+  /** @return compression type being used for the column family for major 
+      compression */
+  public Compression.Algorithm getCompactionCompression() {
+    String n = getValue(COMPRESSION_COMPACT);
+    if (n == null) {
+      return getCompression();
+    }
     return Compression.Algorithm.valueOf(n.toUpperCase());
   }
 
@@ -371,7 +393,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   }
 
   /**
-   * @return Blocksize.
+   * @return The storefile/hfile blocksize for this column family.
    */
   public synchronized int getBlocksize() {
     if (this.blocksize == null) {
@@ -383,7 +405,8 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   }
 
   /**
-   * @param s
+   * @param s Blocksize to use when writing out storefiles/hfiles on this
+   * column family.
    */
   public void setBlocksize(int s) {
     setValue(BLOCKSIZE, Integer.toString(s));
@@ -412,6 +435,30 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
       default: compressionType = "NONE"; break;
     }
     setValue(COMPRESSION, compressionType);
+  }
+
+  /**
+   * @return Compression type setting.
+   */
+  public Compression.Algorithm getCompactionCompressionType() {
+    return getCompactionCompression();
+  }
+
+  /**
+   * Compression types supported in hbase.
+   * LZO is not bundled as part of the hbase distribution.
+   * See <a href="http://wiki.apache.org/hadoop/UsingLzoCompression">LZO Compression</a>
+   * for how to enable it.
+   * @param type Compression type setting.
+   */
+  public void setCompactionCompressionType(Compression.Algorithm type) {
+    String compressionType;
+    switch (type) {
+      case LZO: compressionType = "LZO"; break;
+      case GZ: compressionType = "GZ"; break;
+      default: compressionType = "NONE"; break;
+    }
+    setValue(COMPRESSION_COMPACT, compressionType);
   }
 
   /**
@@ -476,7 +523,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   }
 
   /**
-   * @param toggle bloom filter type
+   * @param bt bloom filter type
    */
   public void setBloomFilterType(final StoreFile.BloomType bt) {
     setValue(BLOOMFILTER, bt.toString());

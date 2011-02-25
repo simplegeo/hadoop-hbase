@@ -23,30 +23,29 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.master.HMaster;
+import org.apache.hadoop.hbase.Abortable;
+import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.client.HConnectionManager;
 import org.apache.hadoop.hbase.master.LogCleanerDelegate;
-import org.apache.hadoop.hbase.replication.ReplicationZookeeperWrapper;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
-import org.apache.zookeeper.WatchedEvent;
-import org.apache.zookeeper.Watcher;
+import org.apache.hadoop.hbase.replication.ReplicationZookeeper;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+import org.apache.zookeeper.KeeperException;
 
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Implementation of a log cleaner that checks if a log is still scheduled for
  * replication before deleting it when its TTL is over.
  */
-public class ReplicationLogCleaner implements LogCleanerDelegate, Watcher {
-
-  private static final Log LOG =
-    LogFactory.getLog(ReplicationLogCleaner.class);
+public class ReplicationLogCleaner implements LogCleanerDelegate, Abortable {
+  private static final Log LOG = LogFactory.getLog(ReplicationLogCleaner.class);
   private Configuration conf;
-  private ReplicationZookeeperWrapper zkHelper;
+  private ReplicationZookeeper zkHelper;
   private Set<String> hlogs = new HashSet<String>();
+  private boolean stopped = false;
 
   /**
    * Instantiates the cleaner, does nothing more.
@@ -55,6 +54,21 @@ public class ReplicationLogCleaner implements LogCleanerDelegate, Watcher {
 
   @Override
   public boolean isLogDeletable(Path filePath) {
+
+    try {
+      if (!zkHelper.getReplication()) {
+        return false;
+      }
+    } catch (KeeperException e) {
+      abort("Cannot get the state of replication", e);
+      return false;
+    }
+
+    // all members of this class are null if replication is disabled, and we
+    // return true since false would render the LogsCleaner useless
+    if (this.conf == null) {
+      return true;
+    }
     String log = filePath.getName();
     // If we saw the hlog previously, let's consider it's still used
     // At some point in the future we will refresh the list and it will be gone
@@ -78,20 +92,20 @@ public class ReplicationLogCleaner implements LogCleanerDelegate, Watcher {
   private boolean refreshHLogsAndSearch(String searchedLog) {
     this.hlogs.clear();
     final boolean lookForLog = searchedLog != null;
-    List<String> rss = zkHelper.getListOfReplicators(this);
+    List<String> rss = zkHelper.getListOfReplicators();
     if (rss == null) {
       LOG.debug("Didn't find any region server that replicates, deleting: " +
           searchedLog);
       return false;
     }
     for (String rs: rss) {
-      List<String> listOfPeers = zkHelper.getListPeersForRS(rs, this);
+      List<String> listOfPeers = zkHelper.getListPeersForRS(rs);
       // if rs just died, this will be null
       if (listOfPeers == null) {
         continue;
       }
       for (String id : listOfPeers) {
-        List<String> peersHlogs = zkHelper.getListHLogsForPeerForRS(rs, id, this);
+        List<String> peersHlogs = zkHelper.getListHLogsForPeerForRS(rs, id);
         if (peersHlogs != null) {
           this.hlogs.addAll(peersHlogs);
         }
@@ -108,14 +122,21 @@ public class ReplicationLogCleaner implements LogCleanerDelegate, Watcher {
 
   @Override
   public void setConf(Configuration conf) {
-    this.conf = conf;
+    // If replication is disabled, keep all members null
+    if (!conf.getBoolean(HConstants.REPLICATION_ENABLE_KEY, false)) {
+      return;
+    }
+    // Make my own Configuration.  Then I'll have my own connection to zk that
+    // I can close myself when comes time.
+    this.conf = new Configuration(conf);
     try {
-      this.zkHelper = new ReplicationZookeeperWrapper(
-          ZooKeeperWrapper.createInstance(this.conf,
-              HMaster.class.getName()),
-          this.conf, new AtomicBoolean(true), null);
+      ZooKeeperWatcher zkw =
+          new ZooKeeperWatcher(this.conf, "replicationLogCleaner", null);
+      this.zkHelper = new ReplicationZookeeper(this, this.conf, zkw);
+    } catch (KeeperException e) {
+      LOG.error("Error while configuring " + this.getClass().getName(), e);
     } catch (IOException e) {
-      LOG.error(e);
+      LOG.error("Error while configuring " + this.getClass().getName(), e);
     }
     refreshHLogsAndSearch(null);
   }
@@ -126,5 +147,24 @@ public class ReplicationLogCleaner implements LogCleanerDelegate, Watcher {
   }
 
   @Override
-  public void process(WatchedEvent watchedEvent) {}
+  public void stop(String why) {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.zkHelper != null) {
+      LOG.info("Stopping " + this.zkHelper.getZookeeperWatcher());
+      this.zkHelper.getZookeeperWatcher().close();
+    }
+    HConnectionManager.deleteConnection(this.conf, true);
+  }
+
+  @Override
+  public boolean isStopped() {
+    return this.stopped;
+  }
+
+  @Override
+  public void abort(String why, Throwable e) {
+    LOG.warn("Aborting ReplicationLogCleaner because " + why, e);
+    stop(why);
+  }
 }

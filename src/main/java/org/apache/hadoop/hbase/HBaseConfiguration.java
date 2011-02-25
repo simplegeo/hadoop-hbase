@@ -19,12 +19,12 @@
  */
 package org.apache.hadoop.hbase;
 
-import java.util.Iterator;
 import java.util.Map.Entry;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.util.VersionInfo;
 
 /**
  * Adds HBase configuration files to a Configuration
@@ -59,9 +59,21 @@ public class HBaseConfiguration extends Configuration {
     }
   }
 
+  private static void checkDefaultsVersion(Configuration conf) {
+    String defaultsVersion = conf.get("hbase.defaults.for.version");
+    String thisVersion = VersionInfo.getVersion();
+    if (!thisVersion.equals(defaultsVersion)) {
+      throw new RuntimeException(
+        "hbase-default.xml file seems to be for and old version of HBase (" +
+        defaultsVersion + "), this version is " + thisVersion);
+    }
+  }
+
   public static Configuration addHbaseResources(Configuration conf) {
     conf.addResource("hbase-default.xml");
     conf.addResource("hbase-site.xml");
+
+    checkDefaultsVersion(conf);
     return conf;
   }
 
@@ -86,58 +98,5 @@ public class HBaseConfiguration extends Configuration {
       conf.set(e.getKey(), e.getValue());
     }
     return conf;
-  }
-
-  /**
-   * Returns the hash code value for this HBaseConfiguration. The hash code of a
-   * HBaseConfiguration is defined by the xor of the hash codes of its entries.
-   *
-   * @see Configuration#iterator() How the entries are obtained.
-   */
-  @Override
-  @Deprecated
-  public int hashCode() {
-    return hashCode(this);
-  }
-
-  /**
-   * Returns the hash code value for this HBaseConfiguration. The hash code of a
-   * Configuration is defined by the xor of the hash codes of its entries.
-   *
-   * @see Configuration#iterator() How the entries are obtained.
-   */
-  public static int hashCode(Configuration conf) {
-    int hash = 0;
-
-    Iterator<Entry<String, String>> propertyIterator = conf.iterator();
-    while (propertyIterator.hasNext()) {
-      hash ^= propertyIterator.next().hashCode();
-    }
-    return hash;
-  }
-
-  @Override
-  public boolean equals(Object obj) {
-    if (this == obj)
-      return true;
-    if (obj == null)
-      return false;
-    if (!(obj instanceof HBaseConfiguration))
-      return false;
-    HBaseConfiguration otherConf = (HBaseConfiguration) obj;
-    if (size() != otherConf.size()) {
-      return false;
-    }
-    Iterator<Entry<String, String>> propertyIterator = this.iterator();
-    while (propertyIterator.hasNext()) {
-      Entry<String, String> entry = propertyIterator.next();
-      String key = entry.getKey();
-      String value = entry.getValue();
-      if (!value.equals(otherConf.getRaw(key))) {
-        return false;
-      }
-    }
-
-    return true;
   }
 }

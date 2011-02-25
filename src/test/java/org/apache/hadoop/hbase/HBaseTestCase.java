@@ -31,6 +31,7 @@ import junit.framework.TestCase;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.client.Delete;
@@ -77,7 +78,7 @@ public abstract class HBaseTestCase extends TestCase {
     initialize();
   }
 
-  public volatile HBaseConfiguration conf;
+  public volatile Configuration conf;
 
   /** constructor */
   public HBaseTestCase() {
@@ -94,7 +95,7 @@ public abstract class HBaseTestCase extends TestCase {
   }
 
   private void init() {
-    conf = new HBaseConfiguration();
+    conf = HBaseConfiguration.create();
     try {
       START_KEY = new String(START_KEY_BYTES, HConstants.UTF8_ENCODING);
     } catch (UnsupportedEncodingException e) {
@@ -669,7 +670,7 @@ public abstract class HBaseTestCase extends TestCase {
     }
   }
 
-  public void assertByteEquals(byte[] expected,
+  public static void assertByteEquals(byte[] expected,
                                byte[] actual) {
     if (Bytes.compareTo(expected, actual) != 0) {
       throw new AssertionFailedError("expected:<" +

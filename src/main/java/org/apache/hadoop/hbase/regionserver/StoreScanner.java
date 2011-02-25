@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.client.Scan;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.NavigableSet;
 
@@ -57,18 +58,21 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
    * @param columns which columns we are scanning
    * @throws IOException
    */
-  StoreScanner(Store store, Scan scan, final NavigableSet<byte[]> columns) throws IOException {
+  StoreScanner(Store store, Scan scan, final NavigableSet<byte[]> columns)
+                              throws IOException {
     this.store = store;
     this.cacheBlocks = scan.getCacheBlocks();
     matcher = new ScanQueryMatcher(scan, store.getFamily().getName(),
         columns, store.ttl, store.comparator.getRawComparator(),
-        store.versionsToReturn(scan.getMaxVersions()));
+        store.versionsToReturn(scan.getMaxVersions()), 
+        false);
 
     this.isGet = scan.isGetScan();
     // pass columns = try to filter out unnecessary ScanFiles
     List<KeyValueScanner> scanners = getScanners(scan, columns);
 
-    // Seek all scanners to the initial key
+    // Seek all scanners to the start of the Row (or if the exact maching row key does not
+    // exist, then to the start of the next matching Row).
     for(KeyValueScanner scanner : scanners) {
       scanner.seek(matcher.getStartKey());
     }
@@ -87,14 +91,15 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
    * @param scan the spec
    * @param scanners ancilliary scanners
    */
-  StoreScanner(Store store, Scan scan, List<? extends KeyValueScanner> scanners)
-      throws IOException {
+  StoreScanner(Store store, Scan scan, List<? extends KeyValueScanner> scanners,
+      boolean retainDeletesInOutput)
+  throws IOException {
     this.store = store;
     this.cacheBlocks = false;
     this.isGet = false;
     matcher = new ScanQueryMatcher(scan, store.getFamily().getName(),
         null, store.ttl, store.comparator.getRawComparator(),
-        store.versionsToReturn(scan.getMaxVersions()));
+        store.versionsToReturn(scan.getMaxVersions()), retainDeletesInOutput);
 
     // Seek all scanners to the initial key
     for(KeyValueScanner scanner : scanners) {
@@ -115,7 +120,7 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
     this.isGet = false;
     this.cacheBlocks = scan.getCacheBlocks();
     this.matcher = new ScanQueryMatcher(scan, colFamily, columns, ttl,
-        comparator.getRawComparator(), scan.getMaxVersions());
+        comparator.getRawComparator(), scan.getMaxVersions(), false);
 
     // Seek all scanners to the initial key
     for(KeyValueScanner scanner : scanners) {
@@ -148,22 +153,33 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
    */
   private List<KeyValueScanner> getScanners(Scan scan,
       final NavigableSet<byte[]> columns) throws IOException {
+    boolean memOnly;
+    boolean filesOnly;
+    if (scan instanceof InternalScan) {
+      InternalScan iscan = (InternalScan)scan;
+      memOnly = iscan.isCheckOnlyMemStore();
+      filesOnly = iscan.isCheckOnlyStoreFiles();
+    } else {
+      memOnly = false;
+      filesOnly = false;
+    }
+    List<KeyValueScanner> scanners = new LinkedList<KeyValueScanner>();
     // First the store file scanners
-    List<StoreFileScanner> sfScanners = StoreFileScanner
+    if (memOnly == false) {
+      List<StoreFileScanner> sfScanners = StoreFileScanner
       .getScannersForStoreFiles(store.getStorefiles(), cacheBlocks, isGet);
-    List<KeyValueScanner> scanners =
-      new ArrayList<KeyValueScanner>(sfScanners.size()+1);
 
-    // include only those scan files which pass all filters
-    for (StoreFileScanner sfs : sfScanners) {
-      if (sfs.shouldSeek(scan, columns)) {
-        scanners.add(sfs);
+      // include only those scan files which pass all filters
+      for (StoreFileScanner sfs : sfScanners) {
+        if (sfs.shouldSeek(scan, columns)) {
+          scanners.add(sfs);
+        }
       }
     }
 
     // Then the memstore scanners
-    if (this.store.memstore.shouldSeek(scan)) {
-      scanners.addAll(this.store.memstore.getScanners());
+    if ((filesOnly == false) && (this.store.memstore.shouldSeek(scan))) {
+        scanners.addAll(this.store.memstore.getScanners());
     }
     return scanners;
   }
@@ -236,12 +252,14 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
     KeyValue kv;
     List<KeyValue> results = new ArrayList<KeyValue>();
     LOOP: while((kv = this.heap.peek()) != null) {
-      ScanQueryMatcher.MatchCode qcode = matcher.match(kv);
+      // kv is no longer immutable due to KeyOnlyFilter! use copy for safety
+      KeyValue copyKv = new KeyValue(kv.getBuffer(), kv.getOffset(), kv.getLength());
+      ScanQueryMatcher.MatchCode qcode = matcher.match(copyKv);
       //DebugPrint.println("SS peek kv = " + kv + " with qcode = " + qcode);
       switch(qcode) {
         case INCLUDE:
-          KeyValue next = this.heap.next();
-          results.add(next);
+          results.add(copyKv);
+          this.heap.next();
           if (limit > 0 && (results.size() == limit)) {
             break LOOP;
           }
@@ -261,18 +279,18 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
           return false;
 
         case SEEK_NEXT_ROW:
+          // This is just a relatively simple end of scan fix, to short-cut end us if there is a
+          // endKey in the scan.
           if (!matcher.moreRowsMayExistAfter(kv)) {
             outResult.addAll(results);
             return false;
           }
-          heap.next();
+
+          reseek(matcher.getKeyForNextRow(kv));
           break;
 
         case SEEK_NEXT_COL:
-          // TODO hfile needs 'hinted' seeking to prevent it from
-          // reseeking from the start of the block on every dang seek.
-          // We need that API and expose it the scanner chain.
-          heap.next();
+          reseek(matcher.getKeyForNextColumn(kv));
           break;
 
         case SKIP:
@@ -356,10 +374,17 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
     // Combine all seeked scanners with a heap
     heap = new KeyValueHeap(scanners, store.comparator);
 
-    // Reset the state of the Query Matcher and set to top row
-    matcher.reset();
+    // Reset the state of the Query Matcher and set to top row.
+    // Only reset and call setRow if the row changes; avoids confusing the
+    // query matcher if scanning intra-row.
     KeyValue kv = heap.peek();
-    matcher.setRow((kv == null ? lastTopKey : kv).getRow());
+    if (kv == null) {
+      kv = lastTopKey;
+    }
+    if ((matcher.row == null) || !kv.matchingRow(matcher.row)) {
+      matcher.reset();
+      matcher.setRow(kv.getRow());
+    }
   }
 
   @Override
@@ -367,5 +392,10 @@ class StoreScanner implements KeyValueScanner, InternalScanner, ChangedReadersOb
     //Heap cannot be null, because this is only called from next() which
     //guarantees that heap will never be null before this call.
     return this.heap.reseek(kv);
+  }
+
+  @Override
+  public long getSequenceID() {
+    return 0;
   }
 }

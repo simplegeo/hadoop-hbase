@@ -64,17 +64,17 @@ hbase_rotate_log ()
     if [ -f "$log" ]; then # rotate logs
     while [ $num -gt 1 ]; do
         prev=`expr $num - 1`
-        [ -f "$log.$prev" ] && mv "$log.$prev" "$log.$num"
+        [ -f "$log.$prev" ] && mv -f "$log.$prev" "$log.$num"
         num=$prev
     done
-    mv "$log" "$log.$num";
+    mv -f "$log" "$log.$num";
     fi
 }
 
 wait_until_done ()
 {
     p=$1
-    cnt=${HBASE_SLAVE_TIMEOUT:-60}
+    cnt=${HBASE_SLAVE_TIMEOUT:-300}
     origcnt=$cnt
     while kill -0 $p > /dev/null 2>&1; do
       if [ $cnt -gt 1 ]; then
@@ -164,6 +164,7 @@ case $startStop in
           echo -n "."
           sleep 1;
         done
+        rm $pid
         echo
       else
         retval=$?

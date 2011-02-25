@@ -26,27 +26,25 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLDecoder;
-import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.util.Base64;
+import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableComparable;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.util.StringUtils;
-import org.apache.hadoop.conf.Configuration;
 
 /**
  * Utility for {@link TableMapper} and {@link TableReducer}
@@ -64,13 +62,40 @@ public class TableMapReduceUtil {
    * @param mapper  The mapper class to use.
    * @param outputKeyClass  The class of the output key.
    * @param outputValueClass  The class of the output value.
-   * @param job  The current job to adjust.
+   * @param job  The current job to adjust.  Make sure the passed job is
+   * carrying all necessary HBase configuration.
    * @throws IOException When setting up the details fails.
    */
   public static void initTableMapperJob(String table, Scan scan,
       Class<? extends TableMapper> mapper,
       Class<? extends WritableComparable> outputKeyClass,
-      Class<? extends Writable> outputValueClass, Job job) throws IOException {
+      Class<? extends Writable> outputValueClass, Job job)
+  throws IOException {
+    initTableMapperJob(table, scan, mapper, outputKeyClass, outputValueClass,
+        job, true);
+  }
+
+  /**
+   * Use this before submitting a TableMap job. It will appropriately set up
+   * the job.
+   *
+   * @param table  The table name to read from.
+   * @param scan  The scan instance with the columns, time range etc.
+   * @param mapper  The mapper class to use.
+   * @param outputKeyClass  The class of the output key.
+   * @param outputValueClass  The class of the output value.
+   * @param job  The current job to adjust.  Make sure the passed job is
+   * carrying all necessary HBase configuration.
+   * @param addDependencyJars upload HBase jars and jars for any of the configured
+   *           job classes via the distributed cache (tmpjars).
+   * @throws IOException When setting up the details fails.
+   */
+  public static void initTableMapperJob(String table, Scan scan,
+      Class<? extends TableMapper> mapper,
+      Class<? extends WritableComparable> outputKeyClass,
+      Class<? extends Writable> outputValueClass, Job job,
+      boolean addDependencyJars)
+  throws IOException {
     job.setInputFormatClass(TableInputFormat.class);
     if (outputValueClass != null) job.setMapOutputValueClass(outputValueClass);
     if (outputKeyClass != null) job.setMapOutputKeyClass(outputKeyClass);
@@ -78,7 +103,9 @@ public class TableMapReduceUtil {
     job.getConfiguration().set(TableInputFormat.INPUT_TABLE, table);
     job.getConfiguration().set(TableInputFormat.SCAN,
       convertScanToString(scan));
-    addDependencyJars(job);
+    if (addDependencyJars) {
+      addDependencyJars(job);
+    }
   }
 
   /**
@@ -148,10 +175,19 @@ public class TableMapReduceUtil {
    *
    * @param table  The output table.
    * @param reducer  The reducer class to use.
-   * @param job  The current job to adjust.
+   * @param job  The current job to adjust.  Make sure the passed job is
+   * carrying all necessary HBase configuration.
    * @param partitioner  Partitioner to use. Pass <code>null</code> to use
    * default partitioner.
-   * @param quorumAddress Distant cluster to write to
+   * @param quorumAddress Distant cluster to write to; default is null for
+   * output to the cluster that is designated in <code>hbase-site.xml</code>.
+   * Set this String to the zookeeper ensemble of an alternate remote cluster
+   * when you would have the reduce write a cluster that is other than the
+   * default; e.g. copying tables between clusters, the source would be
+   * designated by <code>hbase-site.xml</code> and this param would have the
+   * ensemble address of the remote cluster.  The format to pass is particular.
+   * Pass <code> &lt;hbase.zookeeper.quorum>:&lt;hbase.zookeeper.client.port>:&lt;zookeeper.znode.parent>
+   * </code> such as <code>server,server2,server3:2181:/hbase</code>.
    * @param serverClass redefined hbase.regionserver.class
    * @param serverImpl redefined hbase.regionserver.impl
    * @throws IOException When determining the region count fails.
@@ -160,18 +196,49 @@ public class TableMapReduceUtil {
     Class<? extends TableReducer> reducer, Job job,
     Class partitioner, String quorumAddress, String serverClass,
     String serverImpl) throws IOException {
+    initTableReducerJob(table, reducer, job, partitioner, quorumAddress,
+        serverClass, serverImpl, true);
+  }
+
+  /**
+   * Use this before submitting a TableReduce job. It will
+   * appropriately set up the JobConf.
+   *
+   * @param table  The output table.
+   * @param reducer  The reducer class to use.
+   * @param job  The current job to adjust.  Make sure the passed job is
+   * carrying all necessary HBase configuration.
+   * @param partitioner  Partitioner to use. Pass <code>null</code> to use
+   * default partitioner.
+   * @param quorumAddress Distant cluster to write to; default is null for
+   * output to the cluster that is designated in <code>hbase-site.xml</code>.
+   * Set this String to the zookeeper ensemble of an alternate remote cluster
+   * when you would have the reduce write a cluster that is other than the
+   * default; e.g. copying tables between clusters, the source would be
+   * designated by <code>hbase-site.xml</code> and this param would have the
+   * ensemble address of the remote cluster.  The format to pass is particular.
+   * Pass <code> &lt;hbase.zookeeper.quorum>:&lt;hbase.zookeeper.client.port>:&lt;zookeeper.znode.parent>
+   * </code> such as <code>server,server2,server3:2181:/hbase</code>.
+   * @param serverClass redefined hbase.regionserver.class
+   * @param serverImpl redefined hbase.regionserver.impl
+   * @param addDependencyJars upload HBase jars and jars for any of the configured
+   *           job classes via the distributed cache (tmpjars).
+   * @throws IOException When determining the region count fails.
+   */
+  public static void initTableReducerJob(String table,
+    Class<? extends TableReducer> reducer, Job job,
+    Class partitioner, String quorumAddress, String serverClass,
+    String serverImpl, boolean addDependencyJars) throws IOException {
 
     Configuration conf = job.getConfiguration();
     job.setOutputFormatClass(TableOutputFormat.class);
     if (reducer != null) job.setReducerClass(reducer);
     conf.set(TableOutputFormat.OUTPUT_TABLE, table);
+    // If passed a quorum/ensemble address, pass it on to TableOutputFormat.
     if (quorumAddress != null) {
-      if (quorumAddress.split(":").length == 2) {
-        conf.set(TableOutputFormat.QUORUM_ADDRESS, quorumAddress);
-      } else {
-        throw new IOException("Please specify the peer cluster as " +
-            HConstants.ZOOKEEPER_QUORUM+":"+HConstants.ZOOKEEPER_ZNODE_PARENT);
-      }
+      // Calling this will validate the format
+      ZKUtil.transformClusterKey(quorumAddress);
+      conf.set(TableOutputFormat.QUORUM_ADDRESS,quorumAddress);
     }
     if (serverClass != null && serverImpl != null) {
       conf.set(TableOutputFormat.REGION_SERVER_CLASS, serverClass);
@@ -180,7 +247,6 @@ public class TableMapReduceUtil {
     job.setOutputKeyClass(ImmutableBytesWritable.class);
     job.setOutputValueClass(Writable.class);
     if (partitioner == HRegionPartitioner.class) {
-      HBaseConfiguration.addHbaseResources(conf);
       job.setPartitionerClass(HRegionPartitioner.class);
       HTable outputTable = new HTable(conf, table);
       int regions = outputTable.getRegionsInfo().size();
@@ -190,7 +256,10 @@ public class TableMapReduceUtil {
     } else if (partitioner != null) {
       job.setPartitionerClass(partitioner);
     }
-    addDependencyJars(job);
+
+    if (addDependencyJars) {
+      addDependencyJars(job);
+    }
   }
 
   /**
@@ -246,7 +315,6 @@ public class TableMapReduceUtil {
     try {
       addDependencyJars(job.getConfiguration(),
           org.apache.zookeeper.ZooKeeper.class,
-          com.google.common.base.Function.class,
           job.getMapOutputKeyClass(),
           job.getMapOutputValueClass(),
           job.getInputFormatClass(),

@@ -1,5 +1,5 @@
 /*
- * Copyright 20010 The Apache Software Foundation
+ * Copyright 2010 The Apache Software Foundation
  *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -45,7 +45,7 @@ the hadoop cluster before it'll notice your HBase additions.</p>
 <p>As of 0.90.x, HBase will just add its dependency jars to the job
 configuration; the dependencies just need to be available on the local
 <code>CLASSPATH</code>.  For example, to run the bundled HBase
-{@link RowCounter} mapreduce job against a table named <code>usertable</code>,
+{@link org.apache.hadoop.hbase.mapreduce.RowCounter} mapreduce job against a table named <code>usertable</code>,
 type:
 
 <blockquote><pre>
@@ -62,7 +62,7 @@ is set to the HBase <code>CLASSPATH</code> via backticking the command
 etc., dependencies on the passed
 </code>HADOOP_CLASSPATH</code> and adds the found jars to the mapreduce
 job configuration. See the source at
-{@link TableMapReduceUtil#addDependencyJars(org.apache.hadoop.mapreduce.Job)}
+<code>TableMapReduceUtil#addDependencyJars(org.apache.hadoop.mapreduce.Job)</code>
 for how this is done.
 </p>
 <p>The above may not work if you are running your HBase from its build directory;

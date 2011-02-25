@@ -31,6 +31,8 @@ import javax.xml.bind.Marshaller;
 import javax.xml.bind.Unmarshaller;
 
 import org.apache.commons.httpclient.Header;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
@@ -43,38 +45,49 @@ import org.apache.hadoop.hbase.rest.model.CellSetModel;
 import org.apache.hadoop.hbase.rest.model.RowModel;
 import org.apache.hadoop.hbase.util.Bytes;
 
-public class TestRowResource extends HBaseRESTClusterTestBase {
-  static final String TABLE = "TestRowResource";
-  static final String CFA = "a";
-  static final String CFB = "b";
-  static final String COLUMN_1 = CFA + ":1";
-  static final String COLUMN_2 = CFB + ":2";
-  static final String ROW_1 = "testrow1";
-  static final String VALUE_1 = "testvalue1";
-  static final String ROW_2 = "testrow2";
-  static final String VALUE_2 = "testvalue2";
-  static final String ROW_3 = "testrow3";
-  static final String VALUE_3 = "testvalue3";
-  static final String ROW_4 = "testrow4";
-  static final String VALUE_4 = "testvalue4";
+import static org.junit.Assert.*;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
-  Client client;
-  JAXBContext context;
-  Marshaller marshaller;
-  Unmarshaller unmarshaller;
-  HBaseAdmin admin;
+public class TestRowResource {
+  private static final String TABLE = "TestRowResource";
+  private static final String CFA = "a";
+  private static final String CFB = "b";
+  private static final String COLUMN_1 = CFA + ":1";
+  private static final String COLUMN_2 = CFB + ":2";
+  private static final String ROW_1 = "testrow1";
+  private static final String VALUE_1 = "testvalue1";
+  private static final String ROW_2 = "testrow2";
+  private static final String VALUE_2 = "testvalue2";
+  private static final String ROW_3 = "testrow3";
+  private static final String VALUE_3 = "testvalue3";
+  private static final String ROW_4 = "testrow4";
+  private static final String VALUE_4 = "testvalue4";
 
-  @Override
-  protected void setUp() throws Exception {
-    super.setUp();
+  private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+  private static final HBaseRESTTestingUtility REST_TEST_UTIL = 
+    new HBaseRESTTestingUtility();
+  private static Client client;
+  private static JAXBContext context;
+  private static Marshaller marshaller;
+  private static Unmarshaller unmarshaller;
+  private static Configuration conf;
+
+  @BeforeClass
+  public static void setUpBeforeClass() throws Exception {
+    conf = TEST_UTIL.getConfiguration();
+    TEST_UTIL.startMiniCluster(3);
+    REST_TEST_UTIL.startServletContainer(conf);
     context = JAXBContext.newInstance(
         CellModel.class,
         CellSetModel.class,
         RowModel.class);
     marshaller = context.createMarshaller();
     unmarshaller = context.createUnmarshaller();
-    client = new Client(new Cluster().add("localhost", testServletPort));
-    admin = new HBaseAdmin(conf);
+    client = new Client(new Cluster().add("localhost", 
+      REST_TEST_UTIL.getServletPort()));
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     if (admin.tableExists(TABLE)) {
       return;
     }
@@ -84,13 +97,14 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     admin.createTable(htd);
   }
 
-  @Override
-  protected void tearDown() throws Exception {
-    client.shutdown();
-    super.tearDown();
+  @AfterClass
+  public static void tearDownAfterClass() throws Exception {
+    REST_TEST_UTIL.shutdownServletContainer();
+    TEST_UTIL.shutdownMiniCluster();
   }
 
-  Response deleteRow(String table, String row) throws IOException {
+  private static Response deleteRow(String table, String row) 
+      throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
@@ -101,7 +115,7 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     return response;
   }
 
-  Response deleteValue(String table, String row, String column)
+  private static Response deleteValue(String table, String row, String column)
       throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
@@ -115,7 +129,7 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     return response;
   }
 
-  Response getValueXML(String table, String row, String column)
+  private static Response getValueXML(String table, String row, String column)
       throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
@@ -124,11 +138,15 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     path.append(row);
     path.append('/');
     path.append(column);
-    Response response = client.get(path.toString(), MIMETYPE_XML);
+    return getValueXML(path.toString());
+  }
+
+  private static Response getValueXML(String url) throws IOException {
+    Response response = client.get(url, Constants.MIMETYPE_XML);
     return response;
   }
 
-  Response getValuePB(String table, String row, String column) 
+  private static Response getValuePB(String table, String row, String column) 
       throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
@@ -137,12 +155,16 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     path.append(row);
     path.append('/');
     path.append(column);
-    Response response = client.get(path.toString(), MIMETYPE_PROTOBUF); 
+    return getValuePB(path.toString());
+  }
+
+  private static Response getValuePB(String url) throws IOException {
+    Response response = client.get(url, Constants.MIMETYPE_PROTOBUF); 
     return response;
   }
 
-  Response putValueXML(String table, String row, String column, String value)
-      throws IOException, JAXBException {
+  private static Response putValueXML(String table, String row, String column,
+      String value) throws IOException, JAXBException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
@@ -150,6 +172,11 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     path.append(row);
     path.append('/');
     path.append(column);
+    return putValueXML(path.toString(), table, row, column, value);
+  }
+
+  private static Response putValueXML(String url, String table, String row,
+      String column, String value) throws IOException, JAXBException {
     RowModel rowModel = new RowModel(row);
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(value)));
@@ -157,14 +184,14 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     cellSetModel.addRow(rowModel);
     StringWriter writer = new StringWriter();
     marshaller.marshal(cellSetModel, writer);
-    Response response = client.put(path.toString(), MIMETYPE_XML,
+    Response response = client.put(url, Constants.MIMETYPE_XML,
       Bytes.toBytes(writer.toString()));
     Thread.yield();
     return response;
   }
 
-  void checkValueXML(String table, String row, String column, String value)
-      throws IOException, JAXBException {
+  private static void checkValueXML(String table, String row, String column,
+      String value) throws IOException, JAXBException {
     Response response = getValueXML(table, row, column);
     assertEquals(response.getCode(), 200);
     CellSetModel cellSet = (CellSetModel)
@@ -175,8 +202,20 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     assertEquals(Bytes.toString(cell.getValue()), value);
   }
 
-  Response putValuePB(String table, String row, String column, String value)
-      throws IOException {
+  private static void checkValueXML(String url, String table, String row,
+      String column, String value) throws IOException, JAXBException {
+    Response response = getValueXML(url);
+    assertEquals(response.getCode(), 200);
+    CellSetModel cellSet = (CellSetModel)
+      unmarshaller.unmarshal(new ByteArrayInputStream(response.getBody()));
+    RowModel rowModel = cellSet.getRows().get(0);
+    CellModel cell = rowModel.getCells().get(0);
+    assertEquals(Bytes.toString(cell.getColumn()), column);
+    assertEquals(Bytes.toString(cell.getValue()), value);
+  }
+
+  private static Response putValuePB(String table, String row, String column,
+      String value) throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
@@ -184,19 +223,24 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     path.append(row);
     path.append('/');
     path.append(column);
+    return putValuePB(path.toString(), table, row, column, value);
+  }
+
+  private static Response putValuePB(String url, String table, String row,
+      String column, String value) throws IOException {
     RowModel rowModel = new RowModel(row);
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(value)));
     CellSetModel cellSetModel = new CellSetModel();
     cellSetModel.addRow(rowModel);
-    Response response = client.put(path.toString(), MIMETYPE_PROTOBUF,
+    Response response = client.put(url, Constants.MIMETYPE_PROTOBUF,
       cellSetModel.createProtobufOutput());
     Thread.yield();
     return response;
   }
 
-  void checkValuePB(String table, String row, String column, String value)
-      throws IOException {
+  private static void checkValuePB(String table, String row, String column, 
+      String value) throws IOException {
     Response response = getValuePB(table, row, column);
     assertEquals(response.getCode(), 200);
     CellSetModel cellSet = new CellSetModel();
@@ -207,7 +251,8 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     assertEquals(Bytes.toString(cell.getValue()), value);
   }
 
-  void doTestDelete() throws IOException, JAXBException {
+  @Test
+  public void testDelete() throws IOException, JAXBException {
     Response response;
     
     response = putValueXML(TABLE, ROW_1, COLUMN_1, VALUE_1);
@@ -231,7 +276,35 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     assertEquals(response.getCode(), 404);
   }
 
-  void doTestSingleCellGetPutXML() throws IOException, JAXBException {
+  @Test
+  public void testForbidden() throws IOException, JAXBException {
+    Response response;
+
+    conf.set("hbase.rest.readonly", "true");
+
+    response = putValueXML(TABLE, ROW_1, COLUMN_1, VALUE_1);
+    assertEquals(response.getCode(), 403);
+    response = putValuePB(TABLE, ROW_1, COLUMN_1, VALUE_1);
+    assertEquals(response.getCode(), 403);
+    response = deleteValue(TABLE, ROW_1, COLUMN_1);
+    assertEquals(response.getCode(), 403);
+    response = deleteRow(TABLE, ROW_1);
+    assertEquals(response.getCode(), 403);
+
+    conf.set("hbase.rest.readonly", "false");
+
+    response = putValueXML(TABLE, ROW_1, COLUMN_1, VALUE_1);
+    assertEquals(response.getCode(), 200);
+    response = putValuePB(TABLE, ROW_1, COLUMN_1, VALUE_1);
+    assertEquals(response.getCode(), 200);
+    response = deleteValue(TABLE, ROW_1, COLUMN_1);
+    assertEquals(response.getCode(), 200);
+    response = deleteRow(TABLE, ROW_1);
+    assertEquals(response.getCode(), 200);
+  }
+
+  @Test
+  public void testSingleCellGetPutXML() throws IOException, JAXBException {
     Response response = getValueXML(TABLE, ROW_1, COLUMN_1);
     assertEquals(response.getCode(), 404);
 
@@ -243,10 +316,11 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     checkValueXML(TABLE, ROW_1, COLUMN_1, VALUE_2);
 
     response = deleteRow(TABLE, ROW_1);
-    assertEquals(response.getCode(), 200);    
+    assertEquals(response.getCode(), 200);
   }
 
-  void doTestSingleCellGetPutPB() throws IOException, JAXBException {
+  @Test
+  public void testSingleCellGetPutPB() throws IOException, JAXBException {
     Response response = getValuePB(TABLE, ROW_1, COLUMN_1);
     assertEquals(response.getCode(), 404);
 
@@ -262,17 +336,18 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     checkValuePB(TABLE, ROW_1, COLUMN_1, VALUE_2);
 
     response = deleteRow(TABLE, ROW_1);
-    assertEquals(response.getCode(), 200);    
+    assertEquals(response.getCode(), 200);
   }
 
-  void doTestSingleCellGetPutBinary() throws IOException {
+  @Test
+  public void testSingleCellGetPutBinary() throws IOException {
     final String path = "/" + TABLE + "/" + ROW_3 + "/" + COLUMN_1;
     final byte[] body = Bytes.toBytes(VALUE_3);
-    Response response = client.put(path, MIMETYPE_BINARY, body);
+    Response response = client.put(path, Constants.MIMETYPE_BINARY, body);
     assertEquals(response.getCode(), 200);
     Thread.yield();
 
-    response = client.get(path, MIMETYPE_BINARY);
+    response = client.get(path, Constants.MIMETYPE_BINARY);
     assertEquals(response.getCode(), 200);
     assertTrue(Bytes.equals(response.getBody(), body));
     boolean foundTimestampHeader = false;
@@ -288,42 +363,53 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     assertEquals(response.getCode(), 200);
   }
 
-  void doTestSingleCellGetJSON() throws IOException, JAXBException {
+  @Test
+  public void testSingleCellGetJSON() throws IOException, JAXBException {
     final String path = "/" + TABLE + "/" + ROW_4 + "/" + COLUMN_1;
-    Response response = client.put(path, MIMETYPE_BINARY,
+    Response response = client.put(path, Constants.MIMETYPE_BINARY,
       Bytes.toBytes(VALUE_4));
     assertEquals(response.getCode(), 200);
     Thread.yield();
-    response = client.get(path, MIMETYPE_JSON);
+    response = client.get(path, Constants.MIMETYPE_JSON);
     assertEquals(response.getCode(), 200);
     response = deleteRow(TABLE, ROW_4);
     assertEquals(response.getCode(), 200);
   }
 
-  void doTestURLEncodedKey() throws IOException, JAXBException {
-    String encodedKey = URLEncoder.encode("http://www.google.com/", 
-      HConstants.UTF8_ENCODING);
+  @Test
+  public void testURLEncodedKey() throws IOException, JAXBException {
+    String urlKey = "http://example.com/foo";
+    StringBuilder path = new StringBuilder();
+    path.append('/');
+    path.append(TABLE);
+    path.append('/');
+    path.append(URLEncoder.encode(urlKey, HConstants.UTF8_ENCODING));
+    path.append('/');
+    path.append(COLUMN_1);
     Response response;
-    response = putValueXML(TABLE, encodedKey, COLUMN_1, VALUE_1);
+    response = putValueXML(path.toString(), TABLE, urlKey, COLUMN_1,
+      VALUE_1);
     assertEquals(response.getCode(), 200);
-    response = putValuePB(TABLE, encodedKey, COLUMN_2, VALUE_2);
-    assertEquals(response.getCode(), 200);
-    checkValuePB(TABLE, encodedKey, COLUMN_1, VALUE_1);
-    checkValueXML(TABLE, encodedKey, COLUMN_2, VALUE_2);
+    checkValueXML(path.toString(), TABLE, urlKey, COLUMN_1, VALUE_1);
   }
 
+  @Test
   public void testNoSuchCF() throws IOException, JAXBException {
     final String goodPath = "/" + TABLE + "/" + ROW_1 + "/" + CFA+":";
     final String badPath = "/" + TABLE + "/" + ROW_1 + "/" + "BAD";
-    Response response = client.post(goodPath, MIMETYPE_BINARY,
+    Response response = client.post(goodPath, Constants.MIMETYPE_BINARY,
       Bytes.toBytes(VALUE_1));
     assertEquals(response.getCode(), 200);
-    assertEquals(client.get(goodPath, MIMETYPE_BINARY).getCode(), 200);
-    assertEquals(client.get(badPath, MIMETYPE_BINARY).getCode(), 404);
-    assertEquals(client.get(goodPath, MIMETYPE_BINARY).getCode(), 200);
+    assertEquals(client.get(goodPath, Constants.MIMETYPE_BINARY).getCode(),
+      200);
+    assertEquals(client.get(badPath, Constants.MIMETYPE_BINARY).getCode(),
+      404);
+    assertEquals(client.get(goodPath, Constants.MIMETYPE_BINARY).getCode(),
+      200);
   }
 
-  void doTestMultiCellGetPutXML() throws IOException, JAXBException {
+  @Test
+  public void testMultiCellGetPutXML() throws IOException, JAXBException {
     String path = "/" + TABLE + "/fakerow";  // deliberate nonexistent row
 
     CellSetModel cellSetModel = new CellSetModel();
@@ -341,12 +427,12 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     cellSetModel.addRow(rowModel);
     StringWriter writer = new StringWriter();
     marshaller.marshal(cellSetModel, writer);
-    Response response = client.put(path, MIMETYPE_XML,
+    Response response = client.put(path, Constants.MIMETYPE_XML,
       Bytes.toBytes(writer.toString()));
     Thread.yield();
 
     // make sure the fake row was not actually created
-    response = client.get(path, MIMETYPE_XML);
+    response = client.get(path, Constants.MIMETYPE_XML);
     assertEquals(response.getCode(), 404);
 
     // check that all of the values were created
@@ -356,12 +442,13 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     checkValueXML(TABLE, ROW_2, COLUMN_2, VALUE_4);
 
     response = deleteRow(TABLE, ROW_1);
-    assertEquals(response.getCode(), 200);    
+    assertEquals(response.getCode(), 200);
     response = deleteRow(TABLE, ROW_2);
     assertEquals(response.getCode(), 200);
   }
 
-  void doTestMultiCellGetPutPB() throws IOException {
+  @Test
+  public void testMultiCellGetPutPB() throws IOException {
     String path = "/" + TABLE + "/fakerow";  // deliberate nonexistent row
 
     CellSetModel cellSetModel = new CellSetModel();
@@ -377,12 +464,12 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     rowModel.addCell(new CellModel(Bytes.toBytes(COLUMN_2),
       Bytes.toBytes(VALUE_4)));
     cellSetModel.addRow(rowModel);
-    Response response = client.put(path, MIMETYPE_PROTOBUF,
+    Response response = client.put(path, Constants.MIMETYPE_PROTOBUF,
       cellSetModel.createProtobufOutput());
     Thread.yield();
 
     // make sure the fake row was not actually created
-    response = client.get(path, MIMETYPE_PROTOBUF);
+    response = client.get(path, Constants.MIMETYPE_PROTOBUF);
     assertEquals(response.getCode(), 404);
 
     // check that all of the values were created
@@ -392,19 +479,8 @@ public class TestRowResource extends HBaseRESTClusterTestBase {
     checkValuePB(TABLE, ROW_2, COLUMN_2, VALUE_4);
 
     response = deleteRow(TABLE, ROW_1);
-    assertEquals(response.getCode(), 200);    
+    assertEquals(response.getCode(), 200);
     response = deleteRow(TABLE, ROW_2);
     assertEquals(response.getCode(), 200);
-  }
-
-  public void testRowResource() throws Exception {
-    doTestDelete();
-    doTestSingleCellGetPutXML();
-    doTestSingleCellGetPutPB();
-    doTestSingleCellGetPutBinary();
-    doTestSingleCellGetJSON();
-    doTestURLEncodedKey();
-    doTestMultiCellGetPutXML();
-    doTestMultiCellGetPutPB();
   }
 }
