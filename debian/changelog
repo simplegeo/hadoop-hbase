@@ -1,3 +1,12 @@
+hadoop-hbase (0.90.1+9-1sg8) UNRELEASED; urgency=low
+
+  [ Jeremy Grosser ]
+  * Add source/format
+
+  [ SimpleGeo Nerds ]
+
+ -- SimpleGeo Nerds <nerds@simplegeo.com>  Fri, 25 Feb 2011 18:39:10 +0000
+
 hadoop-hbase (0.90.1+9-1sg0) cloudera; urgency=low
 
   Commit fab7fb4175ce4095a8e14b08918d72c72d4cf2df:
